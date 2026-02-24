@@ -1,7 +1,7 @@
 """
 QA-Agent MCP Server.
 
-Provides automated acceptance testing for desktop apps.
+Provides automated acceptance testing for desktop and web apps.
 Implements QA-Agent spec with check taxonomy and abort logic.
 
 Tools:
@@ -14,11 +14,13 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
 from .models import QAReport, ACResult, Status, Severity, CheckLevel, StepLog
-from .executor import stop_app, take_screenshot
+from .desktop_executor import DesktopExecutor, get_desktop_executor
+from .web_executor import WebExecutor, WebConfig, get_web_executor
 from .checks import (
     # Pre-Flight
     check_p01_app_launches,
@@ -46,11 +48,126 @@ from .checks import (
 )
 from .report import build_report
 from .context import fetch_context
-from .vision import ask_vision_bool
+from .vision import ask_vision_bool, ask_vision, set_platform
 from ui_verdict.vm import build_in_vm
 
 
 mcp = FastMCP("qa-agent")
+
+
+def _check_p01_web(
+    executor: WebExecutor,
+    url: str,
+    app_name: str,
+    steps: list[StepLog],
+) -> ACResult:
+    """P-01 for web: Browser opens URL successfully."""
+
+    # Check if executor is available
+    if not executor.is_available():
+        steps.append(
+            StepLog(
+                "Web executor check",
+                "fail",
+                {"error": "Node.js or Midscene not available"},
+            )
+        )
+        return ACResult(
+            ac="Browser opens URL",
+            check_id="P-01",
+            level=CheckLevel.PRE_FLIGHT,
+            status=Status.FAIL,
+            severity=Severity.CRITICAL,
+            diagnosis="Web executor not available. Run: cd midscene && npm install",
+        )
+
+    steps.append(StepLog("Web executor ready", "ok"))
+
+    # Start browser and navigate to URL
+    result = executor.start_app(url, app_name)
+
+    if not result.success:
+        steps.append(
+            StepLog("Browser launch", "fail", {"url": url, "error": result.message})
+        )
+        return ACResult(
+            ac="Browser opens URL",
+            check_id="P-01",
+            level=CheckLevel.PRE_FLIGHT,
+            status=Status.FAIL,
+            severity=Severity.CRITICAL,
+            diagnosis=f"Failed to open URL: {result.message}",
+        )
+
+    # Take screenshot to verify page loaded
+    screenshot = executor.take_screenshot("p01_web")
+    steps.append(StepLog("Browser opened URL", "ok", {"url": url}, screenshot))
+
+    return ACResult(
+        ac="Browser opens URL",
+        check_id="P-01",
+        level=CheckLevel.PRE_FLIGHT,
+        status=Status.PASS,
+        severity=Severity.CRITICAL,
+        diagnosis=f"Successfully opened {url}",
+        screenshot=screenshot,
+    )
+
+
+def _check_p02_web(
+    executor: WebExecutor,
+    steps: list[StepLog],
+) -> ACResult:
+    """P-02 for web: Navigation/interactive elements exist."""
+
+    screenshot = executor.take_screenshot("p02_web")
+
+    description = ask_vision(
+        screenshot,
+        "List all interactive UI elements visible: buttons, menus, toolbars, links, icons. Be brief, just list them.",
+    )
+
+    ui_keywords = [
+        "button",
+        "link",
+        "menu",
+        "icon",
+        "nav",
+        "tab",
+        "input",
+        "search",
+        "form",
+    ]
+    found = any(kw in description.lower() for kw in ui_keywords)
+
+    if not found:
+        steps.append(
+            StepLog("Navigation check", "fail", {"description": description[:200]})
+        )
+        return ACResult(
+            ac="Navigation exists",
+            check_id="P-02",
+            level=CheckLevel.PRE_FLIGHT,
+            status=Status.FAIL,
+            severity=Severity.HIGH,
+            diagnosis="No interactive elements found",
+            screenshot=screenshot,
+        )
+
+    steps.append(
+        StepLog(
+            "Navigation found", "ok", {"description": description[:100]}, screenshot
+        )
+    )
+    return ACResult(
+        ac="Navigation exists",
+        check_id="P-02",
+        level=CheckLevel.PRE_FLIGHT,
+        status=Status.PASS,
+        severity=Severity.HIGH,
+        diagnosis=f"Found: {description[:100]}",
+        screenshot=screenshot,
+    )
 
 
 def _extract_keywords(story: str) -> list[str]:
@@ -108,27 +225,29 @@ def run(
     build_source_path: str | None = None,
     build_vm_dest: str | None = None,
     test_all_buttons: bool = False,
+    platform: Literal["desktop", "web"] = "desktop",
 ) -> str:
     """
-    Run full QA acceptance test suite on a desktop app.
+    Run full QA acceptance test suite on a desktop or web app.
 
     Args:
         story: User story text (e.g. "Als User möchte ich...")
-        binary: Path to app binary in VM (e.g. "/app/myapp")
-        app_name: Process name for pgrep (e.g. "myapp")
+        binary: Path to app binary in VM (desktop) or URL (web)
+        app_name: Process name for pgrep (desktop) or optional name for logging (web)
         acs: Optional explicit acceptance criteria
         feature_hints: Keywords for R-01 feature search
         initial_state: Expected initial state for P-03
-        env: Environment variables for app launch
+        env: Environment variables for app launch (desktop only)
         skip_levels: Levels to skip (e.g. ["edge_cases", "visual"])
         project_id: Manyminds project ID for context fetching
         navigation_action: Explicit action to reach feature (e.g. "key:ctrl+o").
                           If provided, used for R-05 and functional checks. If not, many checks are skipped.
-        build_source_path: Mac path to project root. If set, syncs source to VM and
+        build_source_path: Mac path to project root (desktop only). If set, syncs source to VM and
                           runs cargo build --release before launching the app.
-        build_vm_dest: VM path to build directory (required when build_source_path is set).
+        build_vm_dest: VM path to build directory (desktop only, required when build_source_path is set).
                       E.g. "/home/nwagensonner/imagination-linux"
         test_all_buttons: If True, runs F-06 (all buttons bound check). Slow and noisy, disabled by default.
+        platform: Platform to test on ("desktop" or "web"). Default: "desktop"
 
     Returns:
         JSON string of QAReport with all check results
@@ -139,8 +258,14 @@ def run(
     acs_results: list[ACResult] = []
     skip_levels = skip_levels or []
 
-    # 0. Build latest binary if requested
-    if build_source_path and build_vm_dest:
+    # Select executor based on platform
+    if platform == "web":
+        executor = get_web_executor()
+    else:
+        executor = get_desktop_executor()
+
+    # 0. Build latest binary if requested (desktop only)
+    if platform == "desktop" and build_source_path and build_vm_dest:
         build_result = build_in_vm(build_source_path, build_vm_dest)
         if build_result["success"]:
             steps.append(
@@ -169,7 +294,15 @@ def run(
         steps.append(StepLog("Context fetched", "ok", {"project_id": project_id}))
 
     # 2. Pre-Flight
-    p01 = check_p01_app_launches(binary, app_name, env, steps)
+    if platform == "web":
+        # Web: Use executor directly for pre-flight
+        if not isinstance(executor, WebExecutor):
+            raise ValueError("Expected WebExecutor for web platform")
+        p01 = _check_p01_web(executor, binary, app_name, steps)
+    else:
+        # Desktop: Use existing check
+        p01 = check_p01_app_launches(binary, app_name, env, steps)
+
     acs_results.append(p01)
     if p01.status == Status.FAIL:
         return _abort_report(
@@ -181,10 +314,16 @@ def run(
             "Pre-flight failed: app won't start",
         )
 
-    p02 = check_p02_navigation_exists(steps)
+    if platform == "web":
+        if not isinstance(executor, WebExecutor):
+            raise ValueError("Expected WebExecutor for web platform")
+        p02 = _check_p02_web(executor, steps)
+    else:
+        p02 = check_p02_navigation_exists(steps)
+
     acs_results.append(p02)
     if p02.status == Status.FAIL:
-        stop_app(app_name)
+        executor.stop_app(app_name)
         return _abort_report(
             run_id,
             story,
@@ -203,7 +342,7 @@ def run(
         r01 = check_r01_feature_linked(hints, steps)
         acs_results.append(r01)
         if r01.status == Status.FAIL:
-            stop_app(app_name)
+            executor.stop_app(app_name)
             return _abort_report(
                 run_id,
                 story,
@@ -228,7 +367,7 @@ def run(
         r04 = check_r04_no_feature_flag(steps)
         acs_results.append(r04)
         if r04.status == Status.FAIL:
-            stop_app(app_name)
+            executor.stop_app(app_name)
             return _abort_report(
                 run_id,
                 story,
@@ -252,7 +391,7 @@ def run(
             r05 = check_r05_click_navigates(navigation_action, acs[0], steps)
             acs_results.append(r05)
             if r05.status == Status.FAIL:
-                stop_app(app_name)
+                executor.stop_app(app_name)
                 return _abort_report(
                     run_id,
                     story,
@@ -278,7 +417,7 @@ def run(
         # F-04: Verify each AC is true on current screenshot (NO action, just verify)
         # Take ONE screenshot and check all ACs against it
         if acs:
-            current_screenshot = take_screenshot("functional")
+            current_screenshot = executor.take_screenshot("functional")
 
             for ac_text in acs:
                 result, explanation = ask_vision_bool(
@@ -332,7 +471,7 @@ def run(
 
     # 6. Visual checks on final screenshot
     if "visual" not in skip_levels:
-        final_screenshot = take_screenshot("final")
+        final_screenshot = executor.take_screenshot("final")
         acs_results.append(check_v01_contrast(final_screenshot))
         acs_results.append(check_v02_text_truncated(final_screenshot))
         acs_results.append(check_v03_element_overlaps(final_screenshot))
@@ -341,7 +480,7 @@ def run(
         acs_results.append(check_v06_ui_bleeding(final_screenshot))
 
     # 7. Cleanup
-    stop_app(app_name)
+    executor.stop_app(app_name)
 
     # 8. Build report
     duration = time.time() - start_time
@@ -360,6 +499,7 @@ def run_quick(
     navigation_action: str | None = None,
     build_source_path: str | None = None,
     build_vm_dest: str | None = None,
+    platform: Literal["desktop", "web"] = "desktop",
 ) -> str:
     """
     Quick QA run - Pre-Flight + Reachability only.
@@ -369,15 +509,16 @@ def run_quick(
 
     Args:
         story: User story text (e.g. "Als User möchte ich...")
-        binary: Path to app binary in VM (e.g. "/app/myapp")
-        app_name: Process name for pgrep (e.g. "myapp")
+        binary: Path to app binary in VM (desktop) or URL (web)
+        app_name: Process name for pgrep (desktop) or optional name for logging (web)
         acs: Optional explicit acceptance criteria
         feature_hints: Keywords for R-01 feature search
-        env: Environment variables for app launch
+        env: Environment variables for app launch (desktop only)
         navigation_action: Explicit action to reach feature (e.g. "key:ctrl+o")
-        build_source_path: Mac path to project root. If set, syncs source to VM and
+        build_source_path: Mac path to project root (desktop only). If set, syncs source to VM and
                           runs cargo build --release before launching the app.
-        build_vm_dest: VM path to build directory (required when build_source_path is set).
+        build_vm_dest: VM path to build directory (desktop only, required when build_source_path is set).
+        platform: Platform to test on ("desktop" or "web"). Default: "desktop"
 
     Returns:
         JSON string of QAReport with Pre-Flight and Reachability results only
@@ -393,6 +534,7 @@ def run_quick(
         navigation_action=navigation_action,
         build_source_path=build_source_path,
         build_vm_dest=build_vm_dest,
+        platform=platform,
     )
 
 
@@ -400,6 +542,7 @@ def run_quick(
 def check_screenshot(
     path: str,
     checks: list[str],
+    platform: Literal["desktop", "web"] | None = None,
 ) -> str:
     """
     Check a screenshot with vision model questions.
@@ -407,10 +550,16 @@ def check_screenshot(
     Args:
         path: Local path to screenshot
         checks: List of yes/no questions in English
+        platform: Optional platform hint for vision model selection ("desktop" or "web")
 
     Returns:
         JSON with {"check_text": true/false, ...}
     """
+    if platform:
+        from .vision import set_platform
+
+        set_platform(platform)
+
     results = {}
     for check in checks:
         result, _ = ask_vision_bool(path, check)
