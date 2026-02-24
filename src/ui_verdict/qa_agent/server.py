@@ -170,6 +170,101 @@ def _check_p02_web(
     )
 
 
+def _check_r01_web(
+    executor: WebExecutor,
+    feature_hints: list[str],
+    steps: list[StepLog],
+) -> ACResult:
+    """R-01 for web: Feature linked/visible on page."""
+    screenshot = executor.take_screenshot("r01_web")
+    hints_str = ", ".join(feature_hints)
+
+    # Better prompt for web - describe what you SEE, then check
+    description = ask_vision(
+        screenshot,
+        "Look at this webpage and describe what content and features are visible. "
+        "Focus on: titles, headings, lists, data, and main content areas. Be specific.",
+    )
+
+    # Check if any hint appears in the description
+    description_lower = description.lower()
+    found_hints = [h for h in feature_hints if h.lower() in description_lower]
+
+    if found_hints:
+        steps.append(
+            StepLog(
+                f"Feature linked ({hints_str})",
+                "ok",
+                {"found": found_hints},
+                screenshot,
+            )
+        )
+        return ACResult(
+            ac=f"Feature linked ({hints_str})",
+            check_id="R-01",
+            level=CheckLevel.REACHABILITY,
+            status=Status.PASS,
+            severity=Severity.CRITICAL,
+            diagnosis=f"Found: {', '.join(found_hints)}. Content: {description[:150]}",
+            screenshot=screenshot,
+        )
+
+    # Fallback: direct question
+    result, explanation = ask_vision_bool(
+        screenshot,
+        f"Does this page show content related to any of these topics: {hints_str}? "
+        f"Look for headings, lists, or data that match these keywords.",
+    )
+
+    status = Status.PASS if result else Status.FAIL
+    steps.append(
+        StepLog(
+            f"Feature linked ({hints_str})",
+            "ok" if result else "fail",
+            screenshot=screenshot,
+        )
+    )
+
+    return ACResult(
+        ac=f"Feature linked ({hints_str})",
+        check_id="R-01",
+        level=CheckLevel.REACHABILITY,
+        status=status,
+        severity=Severity.CRITICAL,
+        diagnosis=explanation,
+        screenshot=screenshot,
+    )
+
+
+def _check_r03_web(
+    executor: WebExecutor,
+    feature_desc: str,
+    steps: list[StepLog],
+) -> ACResult:
+    """R-03 for web: Feature clearly visible (not hidden/loading)."""
+    screenshot = executor.take_screenshot("r03_web")
+
+    result, explanation = ask_vision_bool(
+        screenshot,
+        "Is the main content of this page fully loaded and visible? "
+        "There should be no loading spinners, 'coming soon' messages, or error states.",
+    )
+
+    steps.append(
+        StepLog("Content visible", "ok" if result else "fail", screenshot=screenshot)
+    )
+
+    return ACResult(
+        ac="Content visible",
+        check_id="R-03",
+        level=CheckLevel.REACHABILITY,
+        status=Status.PASS if result else Status.FAIL,
+        severity=Severity.CRITICAL,
+        diagnosis=explanation,
+        screenshot=screenshot,
+    )
+
+
 def _extract_keywords(story: str) -> list[str]:
     """Extract likely feature keywords from story."""
     words = story.lower().split()
@@ -339,7 +434,14 @@ def run(
     # 3. Reachability
     if "reachability" not in skip_levels:
         hints = feature_hints or _extract_keywords(story)
-        r01 = check_r01_feature_linked(hints, steps)
+
+        if platform == "web":
+            if not isinstance(executor, WebExecutor):
+                raise ValueError("Expected WebExecutor for web platform")
+            r01 = _check_r01_web(executor, hints, steps)
+        else:
+            r01 = check_r01_feature_linked(hints, steps)
+
         acs_results.append(r01)
         if r01.status == Status.FAIL:
             executor.stop_app(app_name)
@@ -360,7 +462,13 @@ def run(
             )
         )
 
-        r03 = check_r03_feature_visible(hints[0] if hints else "feature", steps)
+        if platform == "web":
+            if not isinstance(executor, WebExecutor):
+                raise ValueError("Expected WebExecutor for web platform")
+            r03 = _check_r03_web(executor, hints[0] if hints else "feature", steps)
+        else:
+            r03 = check_r03_feature_visible(hints[0] if hints else "feature", steps)
+
         acs_results.append(r03)
 
         # R-04: No feature flag blocking
