@@ -14,7 +14,6 @@ from __future__ import annotations
 import base64
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 import httpx
 
@@ -55,7 +54,7 @@ class ParseResult:
 
 
 def parse_screenshot(image_path: str, timeout: float = 30.0) -> ParseResult:
-    """Parse a screenshot using OmniParser V2.
+    """Parse a screenshot using OmniParser.
 
     Args:
         image_path: Path to screenshot file
@@ -64,29 +63,26 @@ def parse_screenshot(image_path: str, timeout: float = 30.0) -> ParseResult:
     Returns:
         ParseResult with detected UI elements
     """
-    # Read and encode image
-    image_bytes = Path(image_path).read_bytes()
-    image_b64 = base64.b64encode(image_bytes).decode()
-
-    # Call OmniParser API
+    # Call OmniParser API with multipart upload
     try:
-        response = httpx.post(
-            f"{OMNIPARSER_URL}/process_image",
-            json={"image": image_b64},
-            timeout=timeout,
-        )
+        with open(image_path, "rb") as f:
+            response = httpx.post(
+                f"{OMNIPARSER_URL}/process_image",
+                files={"image_file": f},
+                timeout=timeout,
+            )
         response.raise_for_status()
         data = response.json()
     except httpx.HTTPError as e:
         raise RuntimeError(f"OmniParser request failed: {e}")
 
-    # Parse response
+    # Parse response - our server returns {"elements": [...]}
     elements = []
-    for elem in data.get("parsed_elements", []):
+    for elem in data.get("elements", []):
         bbox = elem.get("bbox", [0, 0, 0, 0])
         elements.append(
             UIElement(
-                label=elem.get("text", elem.get("description", "")),
+                label=elem.get("label", "icon"),
                 bbox=(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])),
                 interactable=elem.get("interactable", True),
                 confidence=elem.get("confidence", 1.0),
@@ -95,7 +91,7 @@ def parse_screenshot(image_path: str, timeout: float = 30.0) -> ParseResult:
 
     # Get annotated image if available
     annotated = None
-    if "annotated_image" in data:
+    if data.get("annotated_image"):
         annotated = base64.b64decode(data["annotated_image"])
 
     return ParseResult(elements=elements, annotated_image=annotated)
@@ -157,7 +153,10 @@ def get_all_buttons(image_path: str) -> list[UIElement]:
 def is_omniparser_available() -> bool:
     """Check if OmniParser API is available."""
     try:
-        response = httpx.get(f"{OMNIPARSER_URL}/docs", timeout=5.0)
-        return response.status_code == 200
-    except:
+        response = httpx.get(f"{OMNIPARSER_URL}/health", timeout=5.0)
+        if response.status_code != 200:
+            return False
+        data = response.json()
+        return data.get("model_loaded", False)
+    except Exception:
         return False
