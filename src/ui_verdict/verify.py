@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import tempfile
 import time
@@ -272,25 +273,45 @@ RULES:
 - Response must be valid JSON array"""
 
 
+def _get_configured_model() -> str:
+    """Get vision model from environment variable or auto-detect."""
+    configured = os.environ.get("UI_VERDICT_MODEL", "").strip()
+    if configured:
+        return configured
+
+    # Auto-detect: prefer gpt-4o if OpenAI key is set
+    if os.environ.get("OPENAI_API_KEY"):
+        return "gpt-4o"
+
+    # Default to best local fallback
+    return "gemma3:12b"
+
+
 async def verify_with_vision(
     before_path: str,
     after_path: str | None,
     acs: list[str],
 ) -> list[ACResult]:
     """Send screenshots + ACs to vision model, parse response."""
+    model = _get_configured_model()
+    logger.info(f"Using vision model: {model}")
 
-    # Try OpenAI first, fall back to Ollama
-    try:
-        return await _verify_openai(before_path, after_path, acs)
-    except Exception as e:
-        logger.warning(f"OpenAI failed, trying Ollama: {e}")
-        return await _verify_ollama(before_path, after_path, acs)
+    # Route to appropriate provider
+    if model.startswith("gpt-"):
+        try:
+            return await _verify_openai(before_path, after_path, acs, model)
+        except Exception as e:
+            logger.warning(f"OpenAI failed: {e}, falling back to local model")
+            return await _verify_ollama(before_path, after_path, acs)
+
+    # Ollama models
+    return await _verify_ollama(before_path, after_path, acs, model)
 
 
 async def _verify_openai(
-    before_path: str, after_path: str | None, acs: list[str]
+    before_path: str, after_path: str | None, acs: list[str], model: str = "gpt-4o"
 ) -> list[ACResult]:
-    """Verify using OpenAI GPT-4o."""
+    """Verify using OpenAI vision model."""
     import openai
 
     client = openai.AsyncOpenAI()
@@ -319,18 +340,22 @@ async def _verify_openai(
         )
 
     response = await client.chat.completions.create(
-        model="gpt-4o",
+        model=model,
         messages=[{"role": "user", "content": content}],
         max_tokens=1500,
     )
 
-    return _parse_response(response.choices[0].message.content, acs)
+    content_text = response.choices[0].message.content
+    if not content_text:
+        raise ValueError("Empty response from OpenAI")
+
+    return _parse_response(content_text, acs)
 
 
 async def _verify_ollama(
-    before_path: str, after_path: str | None, acs: list[str]
+    before_path: str, after_path: str | None, acs: list[str], model: str = "gemma3:12b"
 ) -> list[ACResult]:
-    """Verify using local Ollama model."""
+    """Verify using local Ollama model with fallback chain."""
     import httpx
 
     prompt = build_verification_prompt(acs, has_before_after=after_path is not None)
@@ -342,32 +367,87 @@ async def _verify_ollama(
         with open(after_path, "rb") as f:
             images.append(base64.b64encode(f.read()).decode())
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "glm-ocr",
-                "prompt": prompt,
-                "images": images,
-                "stream": False,
-            },
-            timeout=60.0,
-        )
+    # Define fallback chain if model is gemma3:12b (best local option)
+    models_to_try = [model]
+    if model == "gemma3:12b":
+        models_to_try.append("glm-ocr")  # Fast fallback if gemma3 fails
 
-    return _parse_response(response.json().get("response", "[]"), acs)
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            logger.info(f"Trying Ollama model: {model_name}")
+            # Gemma3 needs more time for reliable JSON generation
+            timeout = 90.0 if "gemma" in model_name else 60.0
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": model_name,
+                        "prompt": prompt,
+                        "images": images,
+                        "stream": False,
+                    },
+                    timeout=timeout,
+                )
+
+            response_text = response.json().get("response", "")
+            if not response_text:
+                raise ValueError(f"Empty response from {model_name}")
+
+            return _parse_response(response_text, acs)
+
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Ollama model {model_name} failed: {e}")
+            continue
+
+    # All models failed
+    raise Exception(f"All Ollama models failed. Last error: {last_error}")
 
 
 def _parse_response(content: str, acs: list[str]) -> list[ACResult]:
     """Parse vision model response, validate grounding."""
     # Extract JSON from response
     try:
-        # Find JSON array in response
-        start = content.find("[")
-        end = content.rfind("]") + 1
-        if start == -1 or end == 0:
-            raise ValueError("No JSON array found")
-        json_str = content[start:end]
-        results = json.loads(json_str)
+        # Strip markdown code blocks if present
+        cleaned = content.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        if cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+        # Try to find JSON array first
+        array_start = cleaned.find("[")
+        array_end = cleaned.rfind("]") + 1
+
+        # Try to find JSON object as fallback
+        obj_start = cleaned.find("{")
+        obj_end = cleaned.rfind("}") + 1
+
+        results = None
+
+        # Prefer array if found
+        if array_start != -1 and array_end > array_start:
+            json_str = cleaned[array_start:array_end]
+            results = json.loads(json_str)
+
+        # Fall back to single object, wrap in array
+        if results is None and obj_start != -1 and obj_end > obj_start:
+            json_str = cleaned[obj_start:obj_end]
+            single_result = json.loads(json_str)
+            results = [single_result]
+
+        if results is None:
+            raise ValueError("No JSON array or object found in response")
+
+        # Ensure results is a list
+        if not isinstance(results, list):
+            results = [results]
+
     except Exception as e:
         logger.error(f"Failed to parse response: {e}")
         # Return all failures

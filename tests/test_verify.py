@@ -414,6 +414,30 @@ Hope this helps!"""
         assert len(results) == 1
         assert results[0].status == "PASS"
 
+    def test_single_object_wrapped_in_array(self):
+        """Test parsing single object response wrapped into array."""
+        response = """{"index": 1, "status": "PASS", "location": "top-right corner"}"""
+        acs = ["Button is visible"]
+
+        results = _parse_response(response, acs)
+
+        assert len(results) == 1
+        assert results[0].status == "PASS"
+        assert results[0].location == "top-right corner"
+
+    def test_single_object_with_markdown(self):
+        """Test parsing single object with markdown wrapper."""
+        response = """```json
+{"index": 1, "status": "FAIL", "reason": "Not found", "suggestion": "Add button"}
+```"""
+        acs = ["Button is visible"]
+
+        results = _parse_response(response, acs)
+
+        assert len(results) == 1
+        assert results[0].status == "FAIL"
+        assert results[0].reason == "Not found"
+
     def test_generic_location_rejected(self):
         """Test that generic locations are rejected."""
         for generic_location in GENERIC_LOCATIONS:
