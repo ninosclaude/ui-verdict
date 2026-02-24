@@ -682,3 +682,222 @@ def vm_status() -> str:
         
     except Exception as e:
         return f"❌ Status check failed: {e}"
+
+
+# =============================================================================
+# Diff Visualization Tools - Help agents SEE what changed
+# =============================================================================
+
+@mcp.tool()
+def vm_diff_heatmap(
+    action: str,
+    output_path: str | None = None,
+    timeout_ms: int = 500,
+) -> str:
+    """Perform action and generate a heatmap showing WHERE changes occurred.
+    
+    This is more informative than vm_verify_action because it shows the
+    LOCATION of changes, not just whether something changed.
+    
+    Args:
+        action: Input to send (same format as vm_action)
+        output_path: Where to save heatmap. If None, uses temp file.
+        timeout_ms: Wait time after action
+        
+    Returns:
+        Path to heatmap image + stats about changed regions.
+    """
+    try:
+        from .vm import vm_screenshot as take_screenshot, vm_send_key, vm_click, vm_type
+        from .diff.heatmap import generate_heatmap, generate_diff_mask
+        import tempfile
+        import time
+        
+        # Take before screenshot
+        before_path = take_screenshot()
+        before = load_image_gray(before_path)
+        
+        # Send action
+        parts = action.strip().split(":")
+        cmd = parts[0].lower()
+        
+        if cmd == "key":
+            key = parts[1]
+            hold_ms = 50
+            if len(parts) >= 4 and parts[2].lower() == "hold":
+                hold_ms = int(parts[3].lower().replace("ms", ""))
+            vm_send_key(key, hold_ms)
+        elif cmd == "click":
+            coords = parts[1].split(",")
+            vm_click(int(coords[0]), int(coords[1]), "left")
+        elif cmd == "rightclick":
+            coords = parts[1].split(",")
+            vm_click(int(coords[0]), int(coords[1]), "right")
+        elif cmd == "type":
+            text = ":".join(parts[1:])
+            vm_type(text)
+        
+        # Wait
+        time.sleep(timeout_ms / 1000.0)
+        
+        # Take after screenshot
+        after_path = take_screenshot()
+        after = load_image_gray(after_path)
+        
+        # Generate heatmap
+        if output_path is None:
+            fd, output_path = tempfile.mkstemp(suffix="_heatmap.png", prefix="vm_diff_")
+            os.close(fd)
+        
+        _, saved = generate_heatmap(before, after, output_path)
+        
+        # Get stats
+        _, stats = generate_diff_mask(before, after)
+        
+        # Format result
+        if stats["num_regions"] == 0:
+            return f"No changes detected.\nHeatmap: {saved}"
+        
+        regions_str = "\n".join([
+            f"  #{i+1}: ({r['x']},{r['y']}) {r['width']}x{r['height']} ({r['area']}px)"
+            for i, r in enumerate(stats["regions"][:5])
+        ])
+        
+        return f"""Changes detected: {stats['change_ratio']:.1%} of screen
+Regions changed: {stats['num_regions']}
+Top regions:
+{regions_str}
+
+Heatmap saved: {saved}"""
+        
+    except Exception as e:
+        return f"❌ Heatmap generation failed: {e}"
+
+
+@mcp.tool()
+def vm_diff_annotated(
+    action: str,
+    output_path: str | None = None,
+    timeout_ms: int = 500,
+) -> str:
+    """Perform action and generate annotated screenshot with change boxes.
+    
+    Draws red bounding boxes around all regions that changed.
+    
+    Args:
+        action: Input to send
+        output_path: Where to save annotated image
+        timeout_ms: Wait time after action
+        
+    Returns:
+        Path to annotated image + list of changed regions with coordinates.
+    """
+    try:
+        from .vm import vm_screenshot as take_screenshot, vm_send_key, vm_click, vm_type
+        from .diff.heatmap import generate_diff_mask, annotate_changes
+        import tempfile
+        import time
+        
+        # Take before screenshot
+        before_path = take_screenshot()
+        before = load_image_gray(before_path)
+        
+        # Send action
+        parts = action.strip().split(":")
+        cmd = parts[0].lower()
+        
+        if cmd == "key":
+            key = parts[1]
+            hold_ms = 50
+            if len(parts) >= 4 and parts[2].lower() == "hold":
+                hold_ms = int(parts[3].lower().replace("ms", ""))
+            vm_send_key(key, hold_ms)
+        elif cmd == "click":
+            coords = parts[1].split(",")
+            vm_click(int(coords[0]), int(coords[1]), "left")
+        elif cmd == "rightclick":
+            coords = parts[1].split(",")
+            vm_click(int(coords[0]), int(coords[1]), "right")
+        elif cmd == "type":
+            text = ":".join(parts[1:])
+            vm_type(text)
+        
+        # Wait
+        time.sleep(timeout_ms / 1000.0)
+        
+        # Take after screenshot
+        after_path = take_screenshot()
+        after = load_image_gray(after_path)
+        
+        # Get changed regions
+        _, stats = generate_diff_mask(before, after)
+        
+        if stats["num_regions"] == 0:
+            return f"No changes detected.\nAfter screenshot: {after_path}"
+        
+        # Annotate after image
+        if output_path is None:
+            fd, output_path = tempfile.mkstemp(suffix="_annotated.png", prefix="vm_diff_")
+            os.close(fd)
+        
+        saved = annotate_changes(after, stats["regions"], output_path)
+        
+        # Format regions as actionable coordinates
+        regions_str = "\n".join([
+            f"  Region #{i+1}: x={r['x']}, y={r['y']}, w={r['width']}, h={r['height']} (center: {r['x']+r['width']//2}, {r['y']+r['height']//2})"
+            for i, r in enumerate(stats["regions"][:5])
+        ])
+        
+        return f"""Changes detected: {stats['num_regions']} regions
+
+{regions_str}
+
+Annotated image: {saved}
+(Red boxes show changed regions, numbered by size)"""
+        
+    except Exception as e:
+        return f"❌ Annotation failed: {e}"
+
+
+@mcp.tool()
+def vm_compare(
+    output_path: str | None = None,
+) -> str:
+    """Take two screenshots (now and 500ms later) and create side-by-side comparison.
+    
+    Useful for observing animations or delayed changes.
+    
+    Args:
+        output_path: Where to save comparison image
+        
+    Returns:
+        Path to side-by-side comparison image.
+    """
+    try:
+        from .vm import vm_screenshot as take_screenshot
+        from .diff.heatmap import generate_side_by_side
+        import tempfile
+        import time
+        
+        # Take first screenshot
+        before_path = take_screenshot()
+        before = load_image_gray(before_path)
+        
+        # Wait
+        time.sleep(0.5)
+        
+        # Take second screenshot
+        after_path = take_screenshot()
+        after = load_image_gray(after_path)
+        
+        # Generate side-by-side
+        if output_path is None:
+            fd, output_path = tempfile.mkstemp(suffix="_compare.png", prefix="vm_")
+            os.close(fd)
+        
+        saved = generate_side_by_side(before, after, output_path)
+        
+        return f"Side-by-side comparison saved: {saved}"
+        
+    except Exception as e:
+        return f"❌ Comparison failed: {e}"
