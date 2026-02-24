@@ -23,6 +23,12 @@ import { chromium, firefox, webkit } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import readline from 'readline';
 
+// Configure Midscene to use local Ollama
+// Ollama provides OpenAI-compatible API at /v1
+process.env.MIDSCENE_MODEL_NAME = process.env.MIDSCENE_MODEL_NAME || 'glm-ocr';
+process.env.MIDSCENE_MODEL_BASE_URL = process.env.MIDSCENE_MODEL_BASE_URL || 'http://localhost:11434/v1';
+process.env.MIDSCENE_MODEL_FAMILY = process.env.MIDSCENE_MODEL_FAMILY || 'glm-v';
+
 // Browser and Midscene agent instances
 let browser = null;
 let page = null;

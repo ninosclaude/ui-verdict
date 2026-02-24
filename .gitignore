@@ -8,3 +8,4 @@ build/
 .eggs/
 
 node_modules/
+midscene_run/
