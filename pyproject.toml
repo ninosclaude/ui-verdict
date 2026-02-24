@@ -33,7 +33,7 @@ vision = [
 ]
 
 [project.scripts]
-ui-verdict = "ui_verdict.server:main"
+ui-verdict = "ui_verdict.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ui_verdict"]

@@ -1,0 +1,74 @@
+name: Visual Regression Test
+
+on:
+  workflow_call:
+    inputs:
+      url:
+        description: 'URL to test'
+        required: true
+        type: string
+      baseline_name:
+        description: 'Baseline name for comparison'
+        required: false
+        type: string
+      platform:
+        description: 'Platform (web or desktop)'
+        required: false
+        type: string
+        default: 'web'
+      acceptance_criteria:
+        description: 'Comma-separated acceptance criteria'
+        required: false
+        type: string
+
+jobs:
+  visual-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install ui-verdict
+        run: pip install ui-verdict
+      
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+      
+      - name: Run Visual Test
+        id: test
+        run: |
+          ARGS="${{ inputs.url }} --platform ${{ inputs.platform }}"
+          
+          if [ -n "${{ inputs.baseline_name }}" ]; then
+            ARGS="$ARGS --baseline ${{ inputs.baseline_name }}"
+          fi
+          
+          if [ -n "${{ inputs.acceptance_criteria }}" ]; then
+            ARGS="$ARGS --acs '${{ inputs.acceptance_criteria }}'"
+          fi
+          
+          ui-verdict check $ARGS
+      
+      - name: Upload Screenshots
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: visual-regression-screenshots
+          path: |
+            /tmp/qa_web_screenshots/*.png
+            ~/.qa_agent/logs/*.log
+          retention-days: 7
+          if-no-files-found: ignore

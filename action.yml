@@ -1,0 +1,69 @@
+name: 'Visual UI Verdict'
+description: 'AI-powered visual regression testing for web applications'
+author: 'ninosclaude'
+
+branding:
+  icon: 'eye'
+  color: 'purple'
+
+inputs:
+  url:
+    description: 'URL to test'
+    required: true
+  baseline:
+    description: 'Baseline name for comparison (optional)'
+    required: false
+    default: ''
+  platform:
+    description: 'Platform (web or desktop)'
+    required: false
+    default: 'web'
+  acceptance-criteria:
+    description: 'Comma-separated acceptance criteria'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: 'Test result (PASS, WARN, FAIL)'
+    value: ${{ steps.test.outputs.status }}
+  report:
+    description: 'Path to test report'
+    value: ${{ steps.test.outputs.report }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install ui-verdict
+      shell: bash
+      run: pip install ui-verdict
+    
+    - name: Install Playwright
+      shell: bash
+      run: npx playwright install chromium --with-deps
+    
+    - name: Run Visual Test
+      id: test
+      shell: bash
+      run: |
+        ARGS="${{ inputs.url }} --platform ${{ inputs.platform }}"
+        
+        if [ -n "${{ inputs.baseline }}" ]; then
+          ARGS="$ARGS --baseline ${{ inputs.baseline }}"
+        fi
+        
+        if [ -n "${{ inputs.acceptance-criteria }}" ]; then
+          ARGS="$ARGS --acs '${{ inputs.acceptance-criteria }}'"
+        fi
+        
+        ui-verdict check $ARGS
