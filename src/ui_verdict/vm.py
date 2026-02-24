@@ -228,8 +228,16 @@ def deploy_and_run(
     binary_path: str,
     app_name: str,
     args: list[str] | None = None,
+    env: dict[str, str] | None = None,
 ) -> dict:
-    """Deploy a binary to VM and run it."""
+    """Deploy a binary to VM and run it.
+    
+    Args:
+        binary_path: Path to binary (Mac path or VM path starting with /home/ or /tmp/)
+        app_name: Name for the running application
+        args: Command line arguments
+        env: Additional environment variables (e.g., {"GEGL_PATH": "/usr/lib/..."})
+    """
     if not vm_available():
         raise RuntimeError(f"VM '{_config.name}' is not available. Run: orb create ubuntu:24.04 {_config.name}")
     
@@ -262,8 +270,11 @@ def deploy_and_run(
     
     args_str = " ".join(args or [])
     env_vars = f"DISPLAY={_config.display}"
-    if "imagination" in app_name.lower():
-        env_vars += " GEGL_PATH=/usr/lib/aarch64-linux-gnu/gegl-0.4"
+    
+    # Add custom environment variables
+    if env:
+        for key, value in env.items():
+            env_vars += f" {key}={value}"
     
     cmd = f"export {env_vars} && {vm_binary} {args_str} > /tmp/{app_name}.log 2>&1 &"
     _run_in_vm(cmd)

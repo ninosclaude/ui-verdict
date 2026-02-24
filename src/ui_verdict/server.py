@@ -9,6 +9,7 @@ from .diff import classify_change
 from .input import send_action
 from .metrics import check_contrast, check_layout
 from .models import DiffReport, Issue, Region, Severity, VerdictReport
+from .action import parse_action, execute_action, ActionParseError
 
 mcp = FastMCP("ui-verdict")
 
@@ -364,6 +365,7 @@ def vm_deploy(
     binary_path: str,
     app_name: str = "app",
     args: str | None = None,
+    env: str | None = None,
 ) -> str:
     """Deploy and run a GUI application in the Linux VM for testing.
     
@@ -374,19 +376,31 @@ def vm_deploy(
         binary_path: Path to binary on Mac (e.g., "target/release/imagination")
         app_name: Name to identify this app instance
         args: Optional command line arguments (space-separated)
+        env: Optional environment variables (format: "KEY=value,KEY2=value2")
+             Example: "GEGL_PATH=/usr/lib/aarch64-linux-gnu/gegl-0.4"
         
     Returns:
         Status with PID and display info, or error message.
         
     Example:
-        vm_deploy("target/release/imagination", "imagination")
-        # Then use vm_screenshot() or vm_action() to test
+        vm_deploy("target/release/imagination", "imagination", 
+                  env="GEGL_PATH=/usr/lib/aarch64-linux-gnu/gegl-0.4")
     """
     try:
         from .vm import deploy_and_run
         
         args_list = args.split() if args else None
-        result = deploy_and_run(binary_path, app_name, args_list)
+        
+        # Parse env string into dict
+        env_dict = None
+        if env:
+            env_dict = {}
+            for pair in env.split(","):
+                if "=" in pair:
+                    key, value = pair.split("=", 1)
+                    env_dict[key.strip()] = value.strip()
+        
+        result = deploy_and_run(binary_path, app_name, args_list, env_dict)
         
         if result["running"]:
             return f"✅ {app_name} deployed and running\n  PID: {result['pid']}\n  Display: {result['display']}\n  Binary: {result['vm_binary']}"
@@ -437,43 +451,10 @@ def vm_action(action: str) -> str:
         "OK" on success, error message on failure.
     """
     try:
-        from .vm import vm_send_key, vm_click, vm_type
-        import time
-        
-        parts = action.strip().split(":")
-        cmd = parts[0].lower()
-        
-        if cmd == "key":
-            key = parts[1]
-            hold_ms = 50
-            if len(parts) >= 4 and parts[2].lower() == "hold":
-                hold_ms = int(parts[3].lower().replace("ms", ""))
-            vm_send_key(key, hold_ms)
-            return "OK"
-            
-        elif cmd == "click":
-            coords = parts[1].split(",")
-            vm_click(int(coords[0]), int(coords[1]), "left")
-            return "OK"
-            
-        elif cmd == "rightclick":
-            coords = parts[1].split(",")
-            vm_click(int(coords[0]), int(coords[1]), "right")
-            return "OK"
-            
-        elif cmd == "type":
-            text = ":".join(parts[1:])  # Rejoin in case text has colons
-            vm_type(text)
-            return "OK"
-            
-        elif cmd == "wait":
-            ms = int(parts[1].lower().replace("ms", ""))
-            time.sleep(ms / 1000.0)
-            return "OK"
-            
-        else:
-            return f"❌ Unknown action: {cmd}. Use key/click/rightclick/type/wait"
-            
+        execute_action(action)
+        return "OK"
+    except ActionParseError as e:
+        return f"❌ Invalid action: {e}"
     except Exception as e:
         return f"❌ Action failed: {e}"
 
@@ -499,7 +480,7 @@ def vm_verify_action(
         PASS/FAIL verdict with details.
     """
     try:
-        from .vm import vm_screenshot as take_screenshot, vm_send_key, vm_click, vm_type
+        from .vm import vm_screenshot as take_screenshot
         from .diff import classify_change
         from .capture import load_image_gray
         import time
@@ -508,27 +489,8 @@ def vm_verify_action(
         before_path = take_screenshot()
         before = load_image_gray(before_path)
         
-        # Send action (reuse vm_action logic)
-        parts = action.strip().split(":")
-        cmd = parts[0].lower()
-        
-        if cmd == "key":
-            key = parts[1]
-            hold_ms = 50
-            if len(parts) >= 4 and parts[2].lower() == "hold":
-                hold_ms = int(parts[3].lower().replace("ms", ""))
-            vm_send_key(key, hold_ms)
-        elif cmd == "click":
-            coords = parts[1].split(",")
-            vm_click(int(coords[0]), int(coords[1]), "left")
-        elif cmd == "rightclick":
-            coords = parts[1].split(",")
-            vm_click(int(coords[0]), int(coords[1]), "right")
-        elif cmd == "type":
-            text = ":".join(parts[1:])
-            vm_type(text)
-        elif cmd == "wait":
-            pass  # Just wait, no action
+        # Execute action
+        execute_action(action)
         
         # Wait for UI to update
         time.sleep(timeout_ms / 1000.0)
@@ -708,7 +670,7 @@ def vm_diff_heatmap(
         Path to heatmap image + stats about changed regions.
     """
     try:
-        from .vm import vm_screenshot as take_screenshot, vm_send_key, vm_click, vm_type
+        from .vm import vm_screenshot as take_screenshot
         from .diff.heatmap import generate_heatmap, generate_diff_mask
         import tempfile
         import time
@@ -717,25 +679,8 @@ def vm_diff_heatmap(
         before_path = take_screenshot()
         before = load_image_gray(before_path)
         
-        # Send action
-        parts = action.strip().split(":")
-        cmd = parts[0].lower()
-        
-        if cmd == "key":
-            key = parts[1]
-            hold_ms = 50
-            if len(parts) >= 4 and parts[2].lower() == "hold":
-                hold_ms = int(parts[3].lower().replace("ms", ""))
-            vm_send_key(key, hold_ms)
-        elif cmd == "click":
-            coords = parts[1].split(",")
-            vm_click(int(coords[0]), int(coords[1]), "left")
-        elif cmd == "rightclick":
-            coords = parts[1].split(",")
-            vm_click(int(coords[0]), int(coords[1]), "right")
-        elif cmd == "type":
-            text = ":".join(parts[1:])
-            vm_type(text)
+        # Execute action
+        execute_action(action)
         
         # Wait
         time.sleep(timeout_ms / 1000.0)
@@ -793,7 +738,7 @@ def vm_diff_annotated(
         Path to annotated image + list of changed regions with coordinates.
     """
     try:
-        from .vm import vm_screenshot as take_screenshot, vm_send_key, vm_click, vm_type
+        from .vm import vm_screenshot as take_screenshot
         from .diff.heatmap import generate_diff_mask, annotate_changes
         import tempfile
         import time
@@ -802,25 +747,8 @@ def vm_diff_annotated(
         before_path = take_screenshot()
         before = load_image_gray(before_path)
         
-        # Send action
-        parts = action.strip().split(":")
-        cmd = parts[0].lower()
-        
-        if cmd == "key":
-            key = parts[1]
-            hold_ms = 50
-            if len(parts) >= 4 and parts[2].lower() == "hold":
-                hold_ms = int(parts[3].lower().replace("ms", ""))
-            vm_send_key(key, hold_ms)
-        elif cmd == "click":
-            coords = parts[1].split(",")
-            vm_click(int(coords[0]), int(coords[1]), "left")
-        elif cmd == "rightclick":
-            coords = parts[1].split(",")
-            vm_click(int(coords[0]), int(coords[1]), "right")
-        elif cmd == "type":
-            text = ":".join(parts[1:])
-            vm_type(text)
+        # Execute action
+        execute_action(action)
         
         # Wait
         time.sleep(timeout_ms / 1000.0)
