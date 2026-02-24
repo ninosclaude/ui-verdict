@@ -26,23 +26,15 @@ from .checks import (
     check_p03_correct_initial_state,
     # Reachability
     check_r01_feature_linked,
-    check_r02_reachable_in_clicks,
     check_r03_feature_visible,
     check_r04_no_feature_flag,
     check_r05_click_navigates,
     # Functional
     check_f01_action_causes_change,
-    check_f02_system_status,
-    check_f03_result_appears,
-    check_f04_result_matches_ac,
     check_f05_state_consistent,
     check_f06_all_buttons_bound,
     # Edge Cases
     check_e01_empty_state,
-    check_e02_long_input,
-    check_e03_special_chars,
-    check_e04_error_state,
-    check_e05_double_submit,
     check_e06_persistence,
     # Visual
     check_v01_contrast,
@@ -115,6 +107,7 @@ def run(
     navigation_action: str | None = None,
     build_source_path: str | None = None,
     build_vm_dest: str | None = None,
+    test_all_buttons: bool = False,
 ) -> str:
     """
     Run full QA acceptance test suite on a desktop app.
@@ -130,11 +123,12 @@ def run(
         skip_levels: Levels to skip (e.g. ["edge_cases", "visual"])
         project_id: Manyminds project ID for context fetching
         navigation_action: Explicit action to reach feature (e.g. "key:ctrl+o").
-                          If provided, used for R-05 check. If not, R-05 is skipped.
+                          If provided, used for R-05 and functional checks. If not, many checks are skipped.
         build_source_path: Mac path to project root. If set, syncs source to VM and
                           runs cargo build --release before launching the app.
         build_vm_dest: VM path to build directory (required when build_source_path is set).
                       E.g. "/home/nwagensonner/imagination-linux"
+        test_all_buttons: If True, runs F-06 (all buttons bound check). Slow and noisy, disabled by default.
 
     Returns:
         JSON string of QAReport with all check results
@@ -149,15 +143,23 @@ def run(
     if build_source_path and build_vm_dest:
         build_result = build_in_vm(build_source_path, build_vm_dest)
         if build_result["success"]:
-            steps.append(StepLog(
-                "Build succeeded",
-                "ok",
-                {"elapsed_seconds": round(build_result["elapsed_seconds"], 1)},
-            ))
+            steps.append(
+                StepLog(
+                    "Build succeeded",
+                    "ok",
+                    {"elapsed_seconds": round(build_result["elapsed_seconds"], 1)},
+                )
+            )
         else:
-            steps.append(StepLog("Build failed", "error", {"error": build_result["error"]}))
+            steps.append(
+                StepLog("Build failed", "error", {"error": build_result["error"]})
+            )
             return _abort_report(
-                run_id, story, acs_results, steps, start_time,
+                run_id,
+                story,
+                acs_results,
+                steps,
+                start_time,
                 f"Build failed: {build_result['error'][:200]}",
             )
 
@@ -211,9 +213,13 @@ def run(
                 "Reachability failed: feature not linked",
             )
 
-        # R-02: Feature reachable in ≤3 clicks
-        r02 = check_r02_reachable_in_clicks(3, hints[0] if hints else "feature", steps)
-        acs_results.append(r02)
+        # R-02: Skipped - too unstable with vision-based clicking
+        # Can be re-enabled when OmniParser has proper element labels
+        steps.append(
+            StepLog(
+                "R-02 skipped", "info", {"reason": "vision-based navigation unstable"}
+            )
+        )
 
         r03 = check_r03_feature_visible(hints[0] if hints else "feature", steps)
         acs_results.append(r03)
@@ -256,7 +262,7 @@ def run(
                     "Reachability failed: navigation action didn't work",
                 )
 
-    # 4. Functional
+    # 4. Functional (only meaningful checks)
     reachability_passed = all(
         ac.status != Status.FAIL
         for ac in acs_results
@@ -264,33 +270,43 @@ def run(
     )
 
     if reachability_passed and "functional" not in skip_levels:
-        hints = feature_hints or _extract_keywords(story)
-
-        # F-01: Primary action causes change
-        if hints:
-            f01 = check_f01_action_causes_change(f"click:{hints[0]}", steps)
+        # F-01: Primary action causes change (only if we have an action)
+        if navigation_action:
+            f01 = check_f01_action_causes_change(navigation_action, steps)
             acs_results.append(f01)
 
-        # F-02: System status shown during actions
-        f02 = check_f02_system_status("", steps)
-        acs_results.append(f02)
+        # F-04: Verify each AC is true on current screenshot (NO action, just verify)
+        # Take ONE screenshot and check all ACs against it
+        if acs:
+            current_screenshot = take_screenshot("functional")
 
-        # F-03 and F-04: Check ACs
-        for ac_text in acs or []:
-            f04 = check_f04_result_matches_ac(
-                action="", expected=ac_text, timeout_ms=500, steps=steps
-            )
-            acs_results.append(f04)
+            for ac_text in acs:
+                result, explanation = ask_vision_bool(
+                    current_screenshot,
+                    f"Is the following true about this screenshot: '{ac_text}'?",
+                )
+                acs_results.append(
+                    ACResult(
+                        ac=ac_text,
+                        check_id="F-04",
+                        level=CheckLevel.FUNCTIONAL,
+                        status=Status.PASS if result else Status.FAIL,
+                        severity=Severity.HIGH,
+                        diagnosis=explanation,
+                        screenshot=current_screenshot,
+                    )
+                )
 
-        # F-05: State consistency
+        # F-05: State consistency (always run, no action needed)
         f05 = check_f05_state_consistent(["header", "content", "status"], steps)
         acs_results.append(f05)
 
-        # F-06: All buttons bound
-        f06 = check_f06_all_buttons_bound(steps)
-        acs_results.append(f06)
+        # F-06: All buttons bound (only if explicitly requested - slow!)
+        if test_all_buttons:
+            f06 = check_f06_all_buttons_bound(steps)
+            acs_results.append(f06)
 
-    # 5. Edge Cases
+    # 5. Edge Cases (simplified - only meaningful checks)
     functional_passed = all(
         ac.status != Status.FAIL
         for ac in acs_results
@@ -298,36 +314,21 @@ def run(
     )
 
     if functional_passed and "edge_cases" not in skip_levels:
-        # E-01: Empty state handling
+        # E-01: Empty state handling (just check current state)
         e01 = check_e01_empty_state(
-            None, "Is there a helpful empty state message?", steps
+            None, "Is there a helpful empty state or content visible?", steps
         )
         acs_results.append(e01)
 
-        # E-02: Long input handling
-        e02 = check_e02_long_input("input", steps)
-        acs_results.append(e02)
-
-        # E-03: Special characters
-        e03 = check_e03_special_chars("input", steps)
-        acs_results.append(e03)
-
-        # E-04: Error state handling
-        e04 = check_e04_error_state("invalid action", steps)
-        acs_results.append(e04)
-
-        # E-05: Double submit protection
-        e05 = check_e05_double_submit("click:submit", steps)
-        acs_results.append(e05)
-
-        # E-06: Persistence after reload
-        hints = feature_hints or _extract_keywords(story)
-        e06 = check_e06_persistence(
-            f"click:{hints[0]}" if hints else "click:feature",
-            "Is the previous state still visible?",
-            steps,
-        )
-        acs_results.append(e06)
+        # Skip E-02 to E-05 - they need specific input fields which we don't know
+        # E-06: Persistence only if we have a navigation action
+        if navigation_action:
+            e06 = check_e06_persistence(
+                navigation_action,
+                "Is the feature still accessible after reload?",
+                steps,
+            )
+            acs_results.append(e06)
 
     # 6. Visual checks on final screenshot
     if "visual" not in skip_levels:

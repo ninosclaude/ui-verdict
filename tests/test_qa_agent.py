@@ -652,3 +652,40 @@ class TestServer:
         assert len(data) == 2
         assert data["Is button visible?"] is True
         assert data["Is text readable?"] is False
+
+
+class TestVisionParsing:
+    """Tests for robust YES/NO parsing."""
+
+    def test_parse_yes_no_direct_yes(self):
+        from ui_verdict.qa_agent.vision import _parse_yes_no
+        assert _parse_yes_no("YES: this is correct") is True
+        assert _parse_yes_no("yes, I agree") is True
+
+    def test_parse_yes_no_direct_no(self):
+        from ui_verdict.qa_agent.vision import _parse_yes_no
+        assert _parse_yes_no("NO: this is wrong") is False
+        assert _parse_yes_no("no, I disagree") is False
+
+    def test_parse_yes_no_with_format_prefix(self):
+        from ui_verdict.qa_agent.vision import _parse_yes_no
+        # Model sometimes repeats the prompt format
+        assert _parse_yes_no("Format: YES: this is correct") is True
+        assert _parse_yes_no("Format: NO: this is wrong") is False
+
+    def test_parse_yes_no_embedded(self):
+        from ui_verdict.qa_agent.vision import _parse_yes_no
+        assert _parse_yes_no("I think yes, it looks correct") is True
+        assert _parse_yes_no("Looking at this, no it doesn't match") is False
+
+    def test_parse_yes_no_both_present_uses_first(self):
+        from ui_verdict.qa_agent.vision import _parse_yes_no
+        # When both YES and NO appear, use the first one
+        assert _parse_yes_no("Yes, but no issues") is True
+        assert _parse_yes_no("No, yes it's fine") is False
+
+    def test_parse_yes_no_indicators(self):
+        from ui_verdict.qa_agent.vision import _parse_yes_no
+        # Fallback indicators
+        assert _parse_yes_no("The element is visible on screen") is True
+        assert _parse_yes_no("The element is missing from view") is False
