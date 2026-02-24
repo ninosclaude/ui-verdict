@@ -1055,5 +1055,36 @@ def baseline_list() -> str:
     )
 
 
+@mcp.tool()
+def verify_acs(
+    url: str,
+    acs: list[str],
+    timeout_seconds: float = 30.0,
+) -> str:
+    """Verify acceptance criteria against a live URL.
+
+    Fast, reliable verification for AI coding agents.
+    Single vision call, mandatory grounding, actionable failures.
+
+    Args:
+        url: The page to verify (e.g., "http://localhost:3000/login")
+        acs: List of acceptance criteria to verify
+        timeout_seconds: Max time for operation (default: 30s)
+
+    Returns:
+        JSON with passed/failed ACs, reasons, and suggestions
+
+    Example:
+        verify_acs(
+            url="http://localhost:3000",
+            acs=["Login button is visible", "Clicking login shows spinner"]
+        )
+    """
+    from ..verify import verify_acs as _verify_acs
+
+    result = _verify_acs(url, acs, timeout_seconds=timeout_seconds)
+    return json.dumps(result.to_dict(), indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()

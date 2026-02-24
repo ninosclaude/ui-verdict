@@ -8,8 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.ui_verdict.qa_agent.web_executor import WebConfig, WebExecutor
-from src.ui_verdict.qa_agent.executor_protocol import AppStartResult, PixelDiffResult
+from ui_verdict.qa_agent.web_executor import WebConfig, WebExecutor
+from ui_verdict.qa_agent.executor_protocol import AppStartResult, PixelDiffResult
 
 
 class TestWebConfig:
@@ -572,7 +572,7 @@ class TestWebExecutorFactory:
 
     def test_get_web_executor_singleton(self):
         """Test get_web_executor returns singleton."""
-        from src.ui_verdict.qa_agent.web_executor import get_web_executor
+        from ui_verdict.qa_agent.web_executor import get_web_executor
 
         executor1 = get_web_executor()
         executor2 = get_web_executor()
@@ -581,11 +581,11 @@ class TestWebExecutorFactory:
 
     def test_get_web_executor_creates_instance(self):
         """Test get_web_executor creates WebExecutor instance."""
-        from src.ui_verdict.qa_agent.web_executor import (
+        from ui_verdict.qa_agent.web_executor import (
             get_web_executor,
             _default_executor,
         )
-        import src.ui_verdict.qa_agent.web_executor as module
+        import ui_verdict.qa_agent.web_executor as module
 
         # Reset singleton
         original = module._default_executor

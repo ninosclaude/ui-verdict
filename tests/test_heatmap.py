@@ -4,7 +4,7 @@ import numpy as np
 import tempfile
 import os
 
-from src.ui_verdict.diff.heatmap import (
+from ui_verdict.diff.heatmap import (
     generate_heatmap,
     generate_diff_mask,
     generate_side_by_side,
