@@ -11,6 +11,7 @@ Tools:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -325,6 +326,8 @@ def run(
     build_vm_dest: str | None = None,
     test_all_buttons: bool = False,
     platform: Literal["desktop", "web"] = "desktop",
+    baseline_mode: bool = False,
+    baseline_name: str | None = None,
 ) -> str:
     """
     Run full QA acceptance test suite on a desktop or web app.
@@ -350,6 +353,8 @@ def run(
                           destructive actions (logout, delete, etc.). Disabled by default.
                           Only enable in isolated test environments.
         platform: Platform to test on ("desktop" or "web"). Default: "desktop"
+        baseline_mode: If True, enables baseline visual comparison instead of detailed checks.
+        baseline_name: Optional name for baseline. If not provided, generates hash from story.
 
     Returns:
         JSON string of QAReport with all check results
@@ -619,15 +624,99 @@ def run(
                 )
                 acs_results.append(e06)
 
-        # 6. Visual checks on final screenshot
+        # 6. Visual checks
         if "visual" not in skip_levels:
             final_screenshot = executor.take_screenshot("final")
-            acs_results.append(check_v01_contrast(final_screenshot))
-            acs_results.append(check_v02_text_truncated(final_screenshot))
-            acs_results.append(check_v03_element_overlaps(final_screenshot))
-            acs_results.append(check_v04_touch_targets(final_screenshot))
-            acs_results.append(check_v05_render_performance(steps))
-            acs_results.append(check_v06_ui_bleeding(final_screenshot))
+
+            if baseline_mode:
+                from ..baseline import (
+                    BaselineStore,
+                    compare_with_baseline,
+                    compare_no_baseline,
+                    CompareVerdict,
+                )
+
+                store = BaselineStore()
+                effective_name = (
+                    baseline_name
+                    or f"auto_{hashlib.sha256(story.encode()).hexdigest()[:8]}"
+                )
+
+                baseline_data = store.get(effective_name)
+                if baseline_data:
+                    baseline_path, meta = baseline_data
+                    compare_result = compare_with_baseline(
+                        baseline_path, final_screenshot, meta.change_threshold
+                    )
+
+                    # Convert verdict to status
+                    status_map = {
+                        CompareVerdict.NO_CHANGE: Status.PASS,
+                        CompareVerdict.INTENTIONAL: Status.WARN,
+                        CompareVerdict.REGRESSION: Status.FAIL,
+                        CompareVerdict.UNKNOWN: Status.WARN,
+                    }
+
+                    acs_results.append(
+                        ACResult(
+                            ac="Visual baseline match",
+                            check_id="V-00",
+                            level=CheckLevel.VISUAL,
+                            status=status_map[compare_result.verdict],
+                            severity=Severity.HIGH,
+                            diagnosis=compare_result.ai_explanation
+                            or f"change_ratio={compare_result.change_ratio:.4f}",
+                            screenshot=final_screenshot,
+                            details={
+                                "verdict": compare_result.verdict.value,
+                                "change_ratio": compare_result.change_ratio,
+                                "baseline": effective_name,
+                            },
+                        )
+                    )
+
+                    # Skip detailed checks if no change
+                    if compare_result.verdict == CompareVerdict.NO_CHANGE:
+                        steps.append(
+                            StepLog(
+                                "Visual checks skipped",
+                                "info",
+                                {"reason": "baseline match"},
+                            )
+                        )
+                    else:
+                        # Run detailed checks for regression analysis
+                        acs_results.append(check_v01_contrast(final_screenshot))
+                        acs_results.append(check_v02_text_truncated(final_screenshot))
+                        acs_results.append(check_v03_element_overlaps(final_screenshot))
+                        acs_results.append(check_v04_touch_targets(final_screenshot))
+                        acs_results.append(check_v05_render_performance(steps))
+                        acs_results.append(check_v06_ui_bleeding(final_screenshot))
+                else:
+                    # No baseline exists - create one automatically
+                    store.create(effective_name, final_screenshot, url=binary)
+                    steps.append(
+                        StepLog("Baseline created", "info", {"name": effective_name})
+                    )
+                    acs_results.append(
+                        ACResult(
+                            ac="Visual baseline created",
+                            check_id="V-00",
+                            level=CheckLevel.VISUAL,
+                            status=Status.PASS,
+                            severity=Severity.LOW,
+                            diagnosis=f"Created baseline '{effective_name}' for future comparisons",
+                            screenshot=final_screenshot,
+                        )
+                    )
+            else:
+                # Existing visual checks
+                acs_results.append(check_v01_contrast(final_screenshot))
+                acs_results.append(check_v02_text_truncated(final_screenshot))
+                acs_results.append(check_v03_element_overlaps(final_screenshot))
+                acs_results.append(check_v04_touch_targets(final_screenshot))
+                acs_results.append(check_v05_render_performance(steps))
+                acs_results.append(check_v06_ui_bleeding(final_screenshot))
 
         # Build report (success path)
         duration = time.time() - start_time
@@ -732,6 +821,238 @@ def check_screenshot(
         result, _ = ask_vision_bool(path, check)
         results[check] = result
     return json.dumps(results, indent=2)
+
+
+# ============================================================================
+# BASELINE TOOLS
+# ============================================================================
+
+
+@mcp.tool()
+def baseline_create(
+    name: str,
+    url: str | None = None,
+    platform: Literal["desktop", "web"] = "desktop",
+) -> str:
+    """Create a new visual baseline from current URL/app state.
+
+    Opens the URL (web) or launches the app (desktop), takes a screenshot,
+    and saves it as the baseline for future comparisons.
+
+    Args:
+        name: Human-readable name (e.g., "homepage", "login-form", "dashboard")
+        url: URL (web) or binary path (desktop) to capture
+        platform: Platform to use ("desktop" or "web")
+
+    Returns:
+        JSON with baseline metadata
+
+    Example:
+        baseline_create(name="github-trending", url="https://github.com/trending", platform="web")
+    """
+    from ..baseline import BaselineStore
+
+    if not url:
+        return json.dumps({"error": "url is required"})
+
+    # Select executor
+    if platform == "web":
+        executor = get_web_executor()
+    else:
+        executor = get_desktop_executor()
+
+    try:
+        # Start app/browser
+        result = executor.start_app(url, name)
+        if not result.success:
+            return json.dumps({"error": f"Failed to open: {result.message}"})
+
+        # Take screenshot
+        screenshot_path = executor.take_screenshot(f"baseline_{name}")
+
+        # Save baseline
+        store = BaselineStore()
+        meta = store.create(
+            name=name,
+            screenshot_path=screenshot_path,
+            url=url,
+            threshold=0.001,
+        )
+
+        logger.info(f"Created baseline '{name}' from {url}")
+        return json.dumps(
+            {
+                "success": True,
+                "baseline": meta.to_dict(),
+                "screenshot": screenshot_path,
+            }
+        )
+
+    finally:
+        executor.stop_app(name)
+
+
+@mcp.tool()
+def baseline_compare(
+    name: str,
+    url: str | None = None,
+    platform: Literal["desktop", "web"] = "desktop",
+) -> str:
+    """Compare current state against saved baseline.
+
+    Opens the URL/app, takes a screenshot, and compares against the saved baseline.
+    Uses pixel diff for fast detection, then AI for change classification.
+
+    Args:
+        name: Baseline name to compare against
+        url: URL (web) or binary path (desktop). If not provided, uses URL from baseline metadata.
+        platform: Platform to use ("desktop" or "web")
+
+    Returns:
+        JSON with CompareResult (verdict, change_ratio, ai_explanation)
+
+    Verdicts:
+        - NO_CHANGE: Visual identical (pixel diff < 0.1%)
+        - INTENTIONAL: AI detected planned change (new feature, design update)
+        - REGRESSION: AI detected bug (broken layout, missing elements)
+        - UNKNOWN: No baseline exists
+    """
+    from ..baseline import BaselineStore, compare_with_baseline, compare_no_baseline
+
+    store = BaselineStore()
+
+    # Get baseline
+    baseline_data = store.get(name)
+    if not baseline_data:
+        return json.dumps(
+            {
+                "error": f"Baseline '{name}' not found",
+                "available": [b.name for b in store.list_all()],
+            }
+        )
+
+    baseline_path, meta = baseline_data
+
+    # Use stored URL if not provided
+    target_url = url or meta.url
+    if not target_url:
+        return json.dumps({"error": "No URL provided and baseline has no stored URL"})
+
+    # Select executor
+    if platform == "web":
+        executor = get_web_executor()
+    else:
+        executor = get_desktop_executor()
+
+    try:
+        # Start app/browser
+        result = executor.start_app(target_url, name)
+        if not result.success:
+            return json.dumps({"error": f"Failed to open: {result.message}"})
+
+        # Take screenshot
+        current_screenshot = executor.take_screenshot(f"compare_{name}")
+
+        # Compare
+        compare_result = compare_with_baseline(
+            baseline_path=baseline_path,
+            current_path=current_screenshot,
+            threshold=meta.change_threshold,
+        )
+
+        logger.info(f"Baseline compare '{name}': {compare_result.verdict.value}")
+        return json.dumps(
+            {
+                "success": True,
+                "result": compare_result.to_dict(),
+            }
+        )
+
+    finally:
+        executor.stop_app(name)
+
+
+@mcp.tool()
+def baseline_update(
+    name: str,
+    url: str | None = None,
+    platform: Literal["desktop", "web"] = "desktop",
+) -> str:
+    """Update existing baseline with current state.
+
+    Use this after confirming a visual change is intentional.
+
+    Args:
+        name: Baseline name to update
+        url: URL (web) or binary path (desktop). Uses stored URL if not provided.
+        platform: Platform to use ("desktop" or "web")
+
+    Returns:
+        JSON with updated baseline metadata
+    """
+    from ..baseline import BaselineStore
+
+    store = BaselineStore()
+
+    # Get existing baseline
+    baseline_data = store.get(name)
+    if not baseline_data:
+        return json.dumps({"error": f"Baseline '{name}' not found"})
+
+    _, meta = baseline_data
+    target_url = url or meta.url
+
+    if not target_url:
+        return json.dumps({"error": "No URL provided and baseline has no stored URL"})
+
+    # Select executor
+    if platform == "web":
+        executor = get_web_executor()
+    else:
+        executor = get_desktop_executor()
+
+    try:
+        # Start app/browser
+        result = executor.start_app(target_url, name)
+        if not result.success:
+            return json.dumps({"error": f"Failed to open: {result.message}"})
+
+        # Take screenshot
+        screenshot_path = executor.take_screenshot(f"baseline_update_{name}")
+
+        # Update baseline
+        updated_meta = store.update(name=name, screenshot_path=screenshot_path)
+
+        logger.info(f"Updated baseline '{name}'")
+        return json.dumps(
+            {
+                "success": True,
+                "baseline": updated_meta.to_dict(),
+            }
+        )
+
+    finally:
+        executor.stop_app(name)
+
+
+@mcp.tool()
+def baseline_list() -> str:
+    """List all saved baselines.
+
+    Returns:
+        JSON array of baseline metadata
+    """
+    from ..baseline import BaselineStore
+
+    store = BaselineStore()
+    baselines = store.list_all()
+
+    return json.dumps(
+        {
+            "count": len(baselines),
+            "baselines": [b.to_dict() for b in baselines],
+        }
+    )
 
 
 if __name__ == "__main__":
