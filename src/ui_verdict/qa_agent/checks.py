@@ -814,10 +814,119 @@ def check_f05_state_consistent(regions: list[str], steps: list[StepLog]) -> ACRe
 
 def check_f06_all_buttons_bound(steps: list[StepLog]) -> ACResult:
     """F-06: Alle Buttons gebunden (jeden klicken, pixel_diff prüfen)."""
+    from .omniparser import get_all_buttons, is_omniparser_available
 
     screenshot = take_screenshot("f06_scan")
 
-    # Get list of all buttons
+    # Try OmniParser first for more reliable button detection
+    if is_omniparser_available():
+        try:
+            buttons = get_all_buttons(screenshot)
+            button_list = [btn.label for btn in buttons]
+
+            if not button_list:
+                steps.append(
+                    StepLog(
+                        "Button scan (OmniParser)", "ok", {"buttons": 0}, screenshot
+                    )
+                )
+                return ACResult(
+                    ac="All buttons bound",
+                    check_id="F-06",
+                    level=CheckLevel.FUNCTIONAL,
+                    status=Status.PASS,
+                    severity=Severity.CRITICAL,
+                    diagnosis="No buttons found on screen (OmniParser)",
+                    screenshot=screenshot,
+                    details={"buttons_checked": 0, "method": "omniparser"},
+                )
+
+            steps.append(
+                StepLog(
+                    "Button scan (OmniParser)",
+                    "ok",
+                    {"buttons": len(button_list)},
+                    screenshot,
+                )
+            )
+
+            unbound_buttons = []
+            for button in button_list:
+                safe_name = _sanitize_for_filename(button)
+                before = take_screenshot(f"f06_before_{safe_name}")
+
+                try:
+                    execute_action(f"click:{button}")
+                except Exception as e:
+                    steps.append(
+                        StepLog(f"Click button: {button}", "fail", {"error": str(e)})
+                    )
+                    unbound_buttons.append({"button": button, "reason": str(e)})
+                    continue
+
+                time.sleep(0.3)
+                after = take_screenshot(f"f06_after_{safe_name}")
+
+                diff = get_pixel_diff(before, after)
+
+                if diff["change_ratio"] < 0.001:
+                    steps.append(
+                        StepLog(
+                            f"Button: {button}",
+                            "fail",
+                            {
+                                "pixel_diff": diff["change_ratio"],
+                                "reason": "no visual response",
+                            },
+                        )
+                    )
+                    unbound_buttons.append(
+                        {"button": button, "reason": "no visual change"}
+                    )
+                else:
+                    steps.append(
+                        StepLog(
+                            f"Button: {button}",
+                            "ok",
+                            {"pixel_diff": diff["change_ratio"]},
+                        )
+                    )
+
+            if unbound_buttons:
+                return ACResult(
+                    ac="All buttons bound",
+                    check_id="F-06",
+                    level=CheckLevel.FUNCTIONAL,
+                    status=Status.FAIL,
+                    severity=Severity.CRITICAL,
+                    diagnosis=f"{len(unbound_buttons)}/{len(button_list)} buttons appear unbound (OmniParser)",
+                    screenshot=screenshot,
+                    details={
+                        "unbound_buttons": unbound_buttons,
+                        "total_buttons": len(button_list),
+                        "method": "omniparser",
+                    },
+                )
+
+            return ACResult(
+                ac="All buttons bound",
+                check_id="F-06",
+                level=CheckLevel.FUNCTIONAL,
+                status=Status.PASS,
+                severity=Severity.CRITICAL,
+                diagnosis=f"All {len(button_list)} buttons responded to clicks (OmniParser)",
+                screenshot=screenshot,
+                details={"buttons_checked": len(button_list), "method": "omniparser"},
+            )
+        except Exception as e:
+            # OmniParser failed, fall back to vision
+            steps.append(
+                StepLog(
+                    "Button scan (OmniParser)", "fail", {"error": str(e)}, screenshot
+                )
+            )
+
+    # Fall back to vision model
     buttons_response = ask_vision(
         screenshot,
         "List all buttons visible on screen. Give me each button's label or icon description, "
@@ -825,16 +934,16 @@ def check_f06_all_buttons_bound(steps: list[StepLog]) -> ACResult:
     )
 
     if "NONE" in buttons_response.upper():
-        steps.append(StepLog("Button scan", "ok", {"buttons": 0}, screenshot))
+        steps.append(StepLog("Button scan (vision)", "ok", {"buttons": 0}, screenshot))
         return ACResult(
             ac="All buttons bound",
             check_id="F-06",
             level=CheckLevel.FUNCTIONAL,
             status=Status.PASS,
             severity=Severity.CRITICAL,
-            diagnosis="No buttons found on screen",
+            diagnosis="No buttons found on screen (vision fallback)",
             screenshot=screenshot,
-            details={"buttons_checked": 0},
+            details={"buttons_checked": 0, "method": "vision"},
         )
 
     # Parse button list
@@ -885,11 +994,12 @@ def check_f06_all_buttons_bound(steps: list[StepLog]) -> ACResult:
             level=CheckLevel.FUNCTIONAL,
             status=Status.FAIL,
             severity=Severity.CRITICAL,
-            diagnosis=f"{len(unbound_buttons)}/{len(button_list)} buttons appear unbound",
+            diagnosis=f"{len(unbound_buttons)}/{len(button_list)} buttons appear unbound (vision fallback)",
             screenshot=screenshot,
             details={
                 "unbound_buttons": unbound_buttons,
                 "total_buttons": len(button_list),
+                "method": "vision",
             },
         )
 
@@ -899,9 +1009,9 @@ def check_f06_all_buttons_bound(steps: list[StepLog]) -> ACResult:
         level=CheckLevel.FUNCTIONAL,
         status=Status.PASS,
         severity=Severity.CRITICAL,
-        diagnosis=f"All {len(button_list)} buttons responded to clicks",
+        diagnosis=f"All {len(button_list)} buttons responded to clicks (vision fallback)",
         screenshot=screenshot,
-        details={"buttons_checked": len(button_list)},
+        details={"buttons_checked": len(button_list), "method": "vision"},
     )
 
 

@@ -130,7 +130,9 @@ def _parse_coordinates(response: str) -> tuple[int | None, int | None]:
 
 
 def click_element_by_text(target_text: str) -> tuple[bool, str]:
-    """Click an element by its visible text/label using vision.
+    """Click an element by its visible text/label.
+
+    Uses OmniParser if available, falls back to vision model.
 
     Args:
         target_text: The text/label to find and click
@@ -138,12 +140,26 @@ def click_element_by_text(target_text: str) -> tuple[bool, str]:
     Returns:
         (success, message)
     """
-    from .vision import ask_vision
+    from .omniparser import find_element_by_text, is_omniparser_available
 
     if not target_text:
         return False, "target_text cannot be empty"
 
     screenshot = take_screenshot("click_target")
+
+    # Try OmniParser first (more reliable)
+    if is_omniparser_available():
+        element = find_element_by_text(screenshot, target_text)
+        if element:
+            x, y = element.center
+            run_in_vm(
+                f"export DISPLAY={_vm_config.display} && xdotool mousemove {x} {y} click 1"
+            )
+            return True, f"Clicked '{element.label}' at ({x}, {y}) via OmniParser"
+        return False, f"OmniParser: Element '{target_text}' not found"
+
+    # Fall back to vision model
+    from .vision import ask_vision
 
     prompt = f"""Find the UI element labeled "{target_text}" in this screenshot.
 Return the bounding box coordinates as: x1,y1,x2,y2
@@ -167,7 +183,7 @@ If element not found, return exactly: NOT_FOUND"""
     run_in_vm(
         f"export DISPLAY={_vm_config.display} && xdotool mousemove {x} {y} click 1"
     )
-    return True, f"Clicked at ({x}, {y})"
+    return True, f"Clicked at ({x}, {y}) via vision fallback"
 
 
 def execute_action(action: str) -> None:

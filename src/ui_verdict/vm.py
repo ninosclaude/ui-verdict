@@ -296,3 +296,44 @@ def deploy_and_run(
         "running": pid is not None,
         "window_id": window_id,
     }
+
+
+def build_in_vm(mac_source_path: str, vm_dest_path: str) -> dict:
+    """Sync source from Mac to VM and run cargo build --release.
+
+    Args:
+        mac_source_path: Absolute Mac path to project root (e.g. "/Users/foo/myapp")
+        vm_dest_path: Absolute VM path to build directory (e.g. "/home/foo/myapp-linux")
+
+    Returns:
+        dict with keys: success (bool), elapsed_seconds (float), error (str | None)
+    """
+    if not vm_available():
+        return {"success": False, "elapsed_seconds": 0.0, "error": f"VM '{_config.name}' not available"}
+
+    start = time.time()
+
+    # 1. Ensure dest dir exists
+    _run_in_vm(f"mkdir -p {vm_dest_path}", timeout=10)
+
+    # 2. Rsync source → VM local storage (exclude target/ and .git/)
+    mac_path = Path(mac_source_path).resolve()
+    rsync_cmd = (
+        f"rsync -a --delete "
+        f"--exclude='target/' --exclude='.git/' --exclude='deps-build/' "
+        f"/mnt/mac{mac_path}/ {vm_dest_path}/"
+    )
+    code, _, err = _run_in_vm(rsync_cmd, timeout=60)
+    if code != 0:
+        return {"success": False, "elapsed_seconds": time.time() - start, "error": f"rsync failed: {err}"}
+
+    # 3. cargo build --release in VM
+    build_cmd = f"source ~/.cargo/env && cd {vm_dest_path} && cargo build --release 2>&1"
+    code, out, err = _run_in_vm(build_cmd, timeout=600)
+    elapsed = time.time() - start
+
+    if code != 0:
+        tail = (out + err)[-2000:]
+        return {"success": False, "elapsed_seconds": elapsed, "error": f"cargo build failed:\n{tail}"}
+
+    return {"success": True, "elapsed_seconds": elapsed, "error": None}

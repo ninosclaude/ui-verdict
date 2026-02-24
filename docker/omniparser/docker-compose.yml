@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  omniparser:
+    image: ghcr.io/addy999/omniparser-api:latest
+    ports:
+      - "7860:7860"
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

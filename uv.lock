@@ -1936,6 +1936,7 @@ name = "ui-verdict"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "mcp" },
     { name = "mss" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1965,6 +1966,7 @@ vision = [
 requires-dist = [
     { name = "anthropic", marker = "extra == 'vision'", specifier = ">=0.30.0" },
     { name = "google-generativeai", marker = "extra == 'vision'", specifier = ">=0.5.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "mss", specifier = ">=9.0.0" },
     { name = "numpy", specifier = ">=1.24.0" },

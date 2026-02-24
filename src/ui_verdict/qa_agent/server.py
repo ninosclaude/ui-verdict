@@ -55,6 +55,7 @@ from .checks import (
 from .report import build_report
 from .context import fetch_context
 from .vision import ask_vision_bool
+from ui_verdict.vm import build_in_vm
 
 
 mcp = FastMCP("qa-agent")
@@ -112,6 +113,8 @@ def run(
     skip_levels: list[str] | None = None,
     project_id: str | None = None,
     navigation_action: str | None = None,
+    build_source_path: str | None = None,
+    build_vm_dest: str | None = None,
 ) -> str:
     """
     Run full QA acceptance test suite on a desktop app.
@@ -128,6 +131,10 @@ def run(
         project_id: Manyminds project ID for context fetching
         navigation_action: Explicit action to reach feature (e.g. "key:ctrl+o").
                           If provided, used for R-05 check. If not, R-05 is skipped.
+        build_source_path: Mac path to project root. If set, syncs source to VM and
+                          runs cargo build --release before launching the app.
+        build_vm_dest: VM path to build directory (required when build_source_path is set).
+                      E.g. "/home/nwagensonner/imagination-linux"
 
     Returns:
         JSON string of QAReport with all check results
@@ -137,6 +144,22 @@ def run(
     steps: list[StepLog] = []
     acs_results: list[ACResult] = []
     skip_levels = skip_levels or []
+
+    # 0. Build latest binary if requested
+    if build_source_path and build_vm_dest:
+        build_result = build_in_vm(build_source_path, build_vm_dest)
+        if build_result["success"]:
+            steps.append(StepLog(
+                "Build succeeded",
+                "ok",
+                {"elapsed_seconds": round(build_result["elapsed_seconds"], 1)},
+            ))
+        else:
+            steps.append(StepLog("Build failed", "error", {"error": build_result["error"]}))
+            return _abort_report(
+                run_id, story, acs_results, steps, start_time,
+                f"Build failed: {build_result['error'][:200]}",
+            )
 
     # 1. Fetch context if project_id given
     if project_id:
@@ -334,6 +357,8 @@ def run_quick(
     feature_hints: list[str] | None = None,
     env: dict[str, str] | None = None,
     navigation_action: str | None = None,
+    build_source_path: str | None = None,
+    build_vm_dest: str | None = None,
 ) -> str:
     """
     Quick QA run - Pre-Flight + Reachability only.
@@ -349,6 +374,9 @@ def run_quick(
         feature_hints: Keywords for R-01 feature search
         env: Environment variables for app launch
         navigation_action: Explicit action to reach feature (e.g. "key:ctrl+o")
+        build_source_path: Mac path to project root. If set, syncs source to VM and
+                          runs cargo build --release before launching the app.
+        build_vm_dest: VM path to build directory (required when build_source_path is set).
 
     Returns:
         JSON string of QAReport with Pre-Flight and Reachability results only
@@ -362,6 +390,8 @@ def run_quick(
         env=env,
         skip_levels=["functional", "edge_cases", "visual"],
         navigation_action=navigation_action,
+        build_source_path=build_source_path,
+        build_vm_dest=build_vm_dest,
     )
 
 
