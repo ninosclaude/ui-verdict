@@ -147,8 +147,8 @@ class TestReport:
 
         assert result == "All checks passed. No fixes needed."
 
-    def test_generate_what_to_fix_preflight_fail(self):
-        """Pre-flight failures get critical section."""
+    def test_generate_what_to_fix_critical_fail(self):
+        """Critical failures get priority section with screenshot."""
         acs = [
             ACResult(
                 ac="App launches",
@@ -157,17 +157,20 @@ class TestReport:
                 status=Status.FAIL,
                 severity=Severity.CRITICAL,
                 diagnosis="Binary not found: /bin/app",
+                screenshot="/tmp/screenshot.png",
             )
         ]
 
         result = generate_what_to_fix(acs)
 
-        assert "🔴 CRITICAL - App won't start:" in result
+        assert "🔴 CRITICAL - Must fix before release:" in result
         assert "[P-01]" in result
-        assert "Binary not found: /bin/app" in result
+        assert "App launches" in result
+        assert "Problem: Binary not found: /bin/app" in result
+        assert "Screenshot: /tmp/screenshot.png" in result
 
-    def test_generate_what_to_fix_reachability_fail(self):
-        """Reachability failures formatted correctly."""
+    def test_generate_what_to_fix_with_screenshot(self):
+        """Screenshot paths included in output."""
         acs = [
             ACResult(
                 ac="Feature linked (settings)",
@@ -176,18 +179,20 @@ class TestReport:
                 status=Status.FAIL,
                 severity=Severity.CRITICAL,
                 diagnosis="No settings button found",
+                screenshot="/tmp/failure.png",
             )
         ]
 
         result = generate_what_to_fix(acs)
 
-        assert "🔴 CRITICAL - Feature not reachable:" in result
+        assert "🔴 CRITICAL - Must fix before release:" in result
         assert "[R-01]" in result
         assert "Feature linked (settings)" in result
-        assert "No settings button found" in result
+        assert "Problem: No settings button found" in result
+        assert "Screenshot: /tmp/failure.png" in result
 
-    def test_generate_what_to_fix_mixed_failures(self):
-        """Multiple failure types grouped correctly."""
+    def test_generate_what_to_fix_mixed_severities(self):
+        """Multiple severities grouped correctly with details."""
         acs = [
             ACResult(
                 ac="App launches",
@@ -196,32 +201,74 @@ class TestReport:
                 status=Status.FAIL,
                 severity=Severity.CRITICAL,
                 diagnosis="VM not available",
+                screenshot="/tmp/p01.png",
             ),
             ACResult(
                 ac="Feature linked",
                 check_id="R-01",
                 level=CheckLevel.REACHABILITY,
                 status=Status.FAIL,
-                severity=Severity.CRITICAL,
+                severity=Severity.HIGH,
                 diagnosis="Feature not found",
+                screenshot="/tmp/r01.png",
             ),
             ACResult(
                 ac="Action works",
                 check_id="F-01",
                 level=CheckLevel.FUNCTIONAL,
                 status=Status.FAIL,
-                severity=Severity.CRITICAL,
+                severity=Severity.MEDIUM,
                 diagnosis="No visual change",
+                screenshot="/tmp/f01.png",
                 details={"change_ratio": 0.0001},
             ),
         ]
 
         result = generate_what_to_fix(acs)
 
-        assert "🔴 CRITICAL - App won't start:" in result
-        assert "🔴 CRITICAL - Feature not reachable:" in result
-        assert "🟠 FUNCTIONAL - Feature broken:" in result
-        assert "pixel_diff: 0.0001" in result
+        assert "🔴 CRITICAL - Must fix before release:" in result
+        assert "[P-01]" in result
+        assert "VM not available" in result
+        assert "/tmp/p01.png" in result
+
+        assert "🟠 HIGH - Should fix:" in result
+        assert "[R-01]" in result
+        assert "Feature not found" in result
+        assert "/tmp/r01.png" in result
+
+        assert "🟡 MEDIUM/LOW:" in result
+        assert "[F-01]" in result
+        assert "No visual change" in result
+        assert "/tmp/f01.png" in result
+        assert "Pixel diff: 0.0001" in result
+
+    def test_generate_what_to_fix_with_warnings(self):
+        """Warnings included with collapsed format."""
+        acs = [
+            ACResult(
+                ac="App launches",
+                check_id="P-01",
+                level=CheckLevel.PRE_FLIGHT,
+                status=Status.PASS,
+                severity=Severity.CRITICAL,
+            ),
+            ACResult(
+                ac="Visual alignment check",
+                check_id="V-01",
+                level=CheckLevel.VISUAL,
+                status=Status.WARN,
+                severity=Severity.LOW,
+                diagnosis="Button alignment off by 2px",
+                screenshot="/tmp/v01.png",
+            ),
+        ]
+
+        result = generate_what_to_fix(acs)
+
+        assert "⚠️ WARNINGS (1 items):" in result
+        assert "[V-01]" in result
+        assert "Button alignment off by 2px" in result
+        assert "See: /tmp/v01.png" in result
 
     def test_compute_level_statuses_all_pass(self):
         """All pass returns PASS for each level."""
@@ -406,6 +453,71 @@ class TestVision:
         result, _ = ask_vision_bool("/fake/path.png", "Is there a button?")
 
         assert result is False
+
+    def test_ask_vision_bool_retries_on_ambiguous(self, mocker):
+        """Ambiguous response triggers retry with stronger prompt."""
+        # Mock _parse_yes_no to control ambiguity detection
+        mock_parse = mocker.patch("ui_verdict.qa_agent.vision._parse_yes_no")
+        mock_parse.side_effect = [
+            (None, "Maybe, I'm not sure"),  # Ambiguous
+            (True, "YES: Definitely visible"),  # Clear on retry
+        ]
+
+        # Mock ask_vision to return raw responses
+        mock_vision = mocker.patch("ui_verdict.qa_agent.vision.ask_vision")
+        mock_vision.side_effect = [
+            "Maybe, I'm not sure",
+            "YES: Definitely visible",
+        ]
+
+        result, explanation = ask_vision_bool(
+            "/fake/path.png", "Is the button visible?", max_retries=3
+        )
+
+        assert result is True
+        assert explanation == "YES: Definitely visible"
+        assert mock_vision.call_count == 2  # Initial + 1 retry
+        # Second call should have stronger prompt
+        second_call_prompt = mock_vision.call_args_list[1][0][1]
+        assert "MUST answer" in second_call_prompt
+
+    def test_ask_vision_bool_exhausts_retries(self, mocker):
+        """After max retries with ambiguous responses, defaults to False."""
+        # Mock _parse_yes_no to always return ambiguous
+        mocker.patch(
+            "ui_verdict.qa_agent.vision._parse_yes_no",
+            return_value=(None, "I cannot determine"),
+        )
+
+        # Mock ask_vision to return ambiguous response
+        mocker.patch(
+            "ui_verdict.qa_agent.vision.ask_vision",
+            return_value="I cannot determine",
+        )
+
+        result, explanation = ask_vision_bool(
+            "/fake/path.png", "Is the button visible?", max_retries=2
+        )
+
+        assert result is False  # Defaults to False
+        assert "AMBIGUOUS AFTER" in explanation
+
+    def test_retry_decorator_on_exception(self, mocker):
+        """Retry decorator handles transient failures."""
+        from ui_verdict.qa_agent.vision import ask_vision
+
+        mock_ollama = mocker.patch("ui_verdict.vision.ask_ollama")
+        # First two calls fail, third succeeds
+        mock_ollama.side_effect = [
+            RuntimeError("Ollama timeout"),
+            RuntimeError("Ollama overloaded"),
+            "YES: Button found",
+        ]
+
+        result = ask_vision("/fake/path.png", "Test question")
+
+        assert result == "YES: Button found"
+        assert mock_ollama.call_count == 3
 
 
 class TestChecks:
@@ -659,33 +771,56 @@ class TestVisionParsing:
 
     def test_parse_yes_no_direct_yes(self):
         from ui_verdict.qa_agent.vision import _parse_yes_no
-        assert _parse_yes_no("YES: this is correct") is True
-        assert _parse_yes_no("yes, I agree") is True
+
+        result, _ = _parse_yes_no("YES: this is correct")
+        assert result is True
+        result, _ = _parse_yes_no("yes, I agree")
+        assert result is True
 
     def test_parse_yes_no_direct_no(self):
         from ui_verdict.qa_agent.vision import _parse_yes_no
-        assert _parse_yes_no("NO: this is wrong") is False
-        assert _parse_yes_no("no, I disagree") is False
+
+        result, _ = _parse_yes_no("NO: this is wrong")
+        assert result is False
+        result, _ = _parse_yes_no("no, I disagree")
+        assert result is False
 
     def test_parse_yes_no_with_format_prefix(self):
         from ui_verdict.qa_agent.vision import _parse_yes_no
+
         # Model sometimes repeats the prompt format
-        assert _parse_yes_no("Format: YES: this is correct") is True
-        assert _parse_yes_no("Format: NO: this is wrong") is False
+        result, _ = _parse_yes_no("Format: YES: this is correct")
+        assert result is True
+        result, _ = _parse_yes_no("Format: NO: this is wrong")
+        assert result is False
 
     def test_parse_yes_no_embedded(self):
         from ui_verdict.qa_agent.vision import _parse_yes_no
-        assert _parse_yes_no("I think yes, it looks correct") is True
-        assert _parse_yes_no("Looking at this, no it doesn't match") is False
+
+        result, _ = _parse_yes_no("I think yes, it looks correct")
+        assert result is True
+        result, _ = _parse_yes_no("Looking at this, no it doesn't match")
+        assert result is False
 
     def test_parse_yes_no_both_present_uses_first(self):
         from ui_verdict.qa_agent.vision import _parse_yes_no
-        # When both YES and NO appear, use the first one
-        assert _parse_yes_no("Yes, but no issues") is True
-        assert _parse_yes_no("No, yes it's fine") is False
+
+        # When YES/NO starts the response, it wins even if other word appears later
+        # "no issues" is a common phrase, not a negative answer
+        result, _ = _parse_yes_no("Yes, but no issues")
+        assert result is True  # YES wins - "no issues" is just explanation
+        result, _ = _parse_yes_no("No, yes it's fine")
+        assert result is False  # NO wins - "yes it's fine" is just explanation
+
+        # But if both appear as actual answers (not starting the response), ambiguous
+        result, _ = _parse_yes_no("The answer could be yes or no depending on context")
+        assert result is None  # Ambiguous - neither at start
 
     def test_parse_yes_no_indicators(self):
         from ui_verdict.qa_agent.vision import _parse_yes_no
-        # Fallback indicators
-        assert _parse_yes_no("The element is visible on screen") is True
-        assert _parse_yes_no("The element is missing from view") is False
+
+        # Fallback indicators - no explicit YES/NO means ambiguous
+        result, _ = _parse_yes_no("The element is visible on screen")
+        assert result is None  # Ambiguous without explicit YES/NO
+        result, _ = _parse_yes_no("The element is missing from view")
+        assert result is None  # Ambiguous without explicit YES/NO

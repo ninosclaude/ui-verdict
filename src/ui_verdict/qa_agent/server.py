@@ -18,6 +18,10 @@ from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
+
 from .models import QAReport, ACResult, Status, Severity, CheckLevel, StepLog
 from .desktop_executor import DesktopExecutor, get_desktop_executor
 from .web_executor import WebExecutor, WebConfig, get_web_executor
@@ -341,7 +345,10 @@ def run(
                           runs cargo build --release before launching the app.
         build_vm_dest: VM path to build directory (desktop only, required when build_source_path is set).
                       E.g. "/home/nwagensonner/imagination-linux"
-        test_all_buttons: If True, runs F-06 (all buttons bound check). Slow and noisy, disabled by default.
+        test_all_buttons: If True, runs F-06 (all buttons bound check).
+                          ⚠️  DANGEROUS: This clicks every visible button which may trigger
+                          destructive actions (logout, delete, etc.). Disabled by default.
+                          Only enable in isolated test environments.
         platform: Platform to test on ("desktop" or "web"). Default: "desktop"
 
     Returns:
@@ -353,247 +360,299 @@ def run(
     acs_results: list[ACResult] = []
     skip_levels = skip_levels or []
 
+    logger.info(
+        f"Starting QA run: {run_id} | story={story[:50]}... | platform={platform}"
+    )
+
     # Select executor based on platform
     if platform == "web":
         executor = get_web_executor()
     else:
         executor = get_desktop_executor()
 
-    # 0. Build latest binary if requested (desktop only)
-    if platform == "desktop" and build_source_path and build_vm_dest:
-        build_result = build_in_vm(build_source_path, build_vm_dest)
-        if build_result["success"]:
-            steps.append(
-                StepLog(
-                    "Build succeeded",
-                    "ok",
-                    {"elapsed_seconds": round(build_result["elapsed_seconds"], 1)},
+    # Track if app was started (for cleanup)
+    app_started = False
+
+    try:
+        # 0. Build latest binary if requested (desktop only)
+        if platform == "desktop" and build_source_path and build_vm_dest:
+            build_result = build_in_vm(build_source_path, build_vm_dest)
+            if build_result["success"]:
+                steps.append(
+                    StepLog(
+                        "Build succeeded",
+                        "ok",
+                        {"elapsed_seconds": round(build_result["elapsed_seconds"], 1)},
+                    )
                 )
-            )
-        else:
-            steps.append(
-                StepLog("Build failed", "error", {"error": build_result["error"]})
-            )
-            return _abort_report(
-                run_id,
-                story,
-                acs_results,
-                steps,
-                start_time,
-                f"Build failed: {build_result['error'][:200]}",
-            )
-
-    # 1. Fetch context if project_id given
-    if project_id:
-        context = fetch_context(project_id, story)
-        steps.append(StepLog("Context fetched", "ok", {"project_id": project_id}))
-
-    # 2. Pre-Flight
-    if platform == "web":
-        # Web: Use executor directly for pre-flight
-        if not isinstance(executor, WebExecutor):
-            raise ValueError("Expected WebExecutor for web platform")
-        p01 = _check_p01_web(executor, binary, app_name, steps)
-    else:
-        # Desktop: Use existing check
-        p01 = check_p01_app_launches(binary, app_name, env, steps)
-
-    acs_results.append(p01)
-    if p01.status == Status.FAIL:
-        return _abort_report(
-            run_id,
-            story,
-            acs_results,
-            steps,
-            start_time,
-            "Pre-flight failed: app won't start",
-        )
-
-    if platform == "web":
-        if not isinstance(executor, WebExecutor):
-            raise ValueError("Expected WebExecutor for web platform")
-        p02 = _check_p02_web(executor, steps)
-    else:
-        p02 = check_p02_navigation_exists(steps)
-
-    acs_results.append(p02)
-    if p02.status == Status.FAIL:
-        executor.stop_app(app_name)
-        return _abort_report(
-            run_id,
-            story,
-            acs_results,
-            steps,
-            start_time,
-            "Pre-flight failed: no navigation found",
-        )
-
-    p03 = check_p03_correct_initial_state(initial_state, steps)
-    acs_results.append(p03)
-
-    # 3. Reachability
-    if "reachability" not in skip_levels:
-        hints = feature_hints or _extract_keywords(story)
-
-        if platform == "web":
-            if not isinstance(executor, WebExecutor):
-                raise ValueError("Expected WebExecutor for web platform")
-            r01 = _check_r01_web(executor, hints, steps)
-        else:
-            r01 = check_r01_feature_linked(hints, steps)
-
-        acs_results.append(r01)
-        if r01.status == Status.FAIL:
-            executor.stop_app(app_name)
-            return _abort_report(
-                run_id,
-                story,
-                acs_results,
-                steps,
-                start_time,
-                "Reachability failed: feature not linked",
-            )
-
-        # R-02: Skipped - too unstable with vision-based clicking
-        # Can be re-enabled when OmniParser has proper element labels
-        steps.append(
-            StepLog(
-                "R-02 skipped", "info", {"reason": "vision-based navigation unstable"}
-            )
-        )
-
-        if platform == "web":
-            if not isinstance(executor, WebExecutor):
-                raise ValueError("Expected WebExecutor for web platform")
-            r03 = _check_r03_web(executor, hints[0] if hints else "feature", steps)
-        else:
-            r03 = check_r03_feature_visible(hints[0] if hints else "feature", steps)
-
-        acs_results.append(r03)
-
-        # R-04: No feature flag blocking
-        r04 = check_r04_no_feature_flag(steps)
-        acs_results.append(r04)
-        if r04.status == Status.FAIL:
-            executor.stop_app(app_name)
-            return _abort_report(
-                run_id,
-                story,
-                acs_results,
-                steps,
-                start_time,
-                "Feature blocked by feature flag",
-            )
-
-        # R-05: Click navigates correctly (only if navigation_action provided)
-        if not navigation_action:
-            steps.append(
-                StepLog(
-                    "R-05 skipped",
-                    "info",
-                    {"reason": "no navigation_action provided"},
+            else:
+                steps.append(
+                    StepLog("Build failed", "error", {"error": build_result["error"]})
                 )
-            )
-
-        if navigation_action and acs:
-            r05 = check_r05_click_navigates(navigation_action, acs[0], steps)
-            acs_results.append(r05)
-            if r05.status == Status.FAIL:
-                executor.stop_app(app_name)
                 return _abort_report(
                     run_id,
                     story,
                     acs_results,
                     steps,
                     start_time,
-                    "Reachability failed: navigation action didn't work",
+                    f"Build failed: {build_result['error'][:200]}",
                 )
 
-    # 4. Functional (only meaningful checks)
-    reachability_passed = all(
-        ac.status != Status.FAIL
-        for ac in acs_results
-        if ac.level == CheckLevel.REACHABILITY
-    )
+        # 1. Fetch context if project_id given
+        if project_id:
+            context = fetch_context(project_id, story)
+            steps.append(StepLog("Context fetched", "ok", {"project_id": project_id}))
 
-    if reachability_passed and "functional" not in skip_levels:
-        # F-01: Primary action causes change (only if we have an action)
-        if navigation_action:
-            f01 = check_f01_action_causes_change(navigation_action, steps)
-            acs_results.append(f01)
+        # 2. Pre-Flight
+        if platform == "web":
+            # Web: Use executor directly for pre-flight
+            if not isinstance(executor, WebExecutor):
+                raise ValueError("Expected WebExecutor for web platform")
+            p01 = _check_p01_web(executor, binary, app_name, steps)
+        else:
+            # Desktop: Use existing check
+            p01 = check_p01_app_launches(binary, app_name, env, steps)
 
-        # F-04: Verify each AC is true on current screenshot (NO action, just verify)
-        # Take ONE screenshot and check all ACs against it
-        if acs:
-            current_screenshot = executor.take_screenshot("functional")
+        acs_results.append(p01)
+        logger.debug(f"P-01 result: {p01.status.name} | {p01.diagnosis[:100]}")
+        if p01.status == Status.FAIL:
+            logger.warning(f"Aborting run {run_id}: P-01 failed (app won't start)")
+            return _abort_report(
+                run_id,
+                story,
+                acs_results,
+                steps,
+                start_time,
+                "Pre-flight failed: app won't start",
+            )
 
-            for ac_text in acs:
-                result, explanation = ask_vision_bool(
-                    current_screenshot,
-                    f"Is the following true about this screenshot: '{ac_text}'?",
+        # App is now started - enable cleanup
+        app_started = True
+
+        if platform == "web":
+            if not isinstance(executor, WebExecutor):
+                raise ValueError("Expected WebExecutor for web platform")
+            p02 = _check_p02_web(executor, steps)
+        else:
+            p02 = check_p02_navigation_exists(steps)
+
+        acs_results.append(p02)
+        if p02.status == Status.FAIL:
+            return _abort_report(
+                run_id,
+                story,
+                acs_results,
+                steps,
+                start_time,
+                "Pre-flight failed: no navigation found",
+            )
+
+        p03 = check_p03_correct_initial_state(initial_state, steps)
+        acs_results.append(p03)
+
+        # 3. Reachability
+        if "reachability" not in skip_levels:
+            hints = feature_hints or _extract_keywords(story)
+
+            if platform == "web":
+                if not isinstance(executor, WebExecutor):
+                    raise ValueError("Expected WebExecutor for web platform")
+                r01 = _check_r01_web(executor, hints, steps)
+            else:
+                r01 = check_r01_feature_linked(hints, steps)
+
+            acs_results.append(r01)
+            if r01.status == Status.FAIL:
+                return _abort_report(
+                    run_id,
+                    story,
+                    acs_results,
+                    steps,
+                    start_time,
+                    "Reachability failed: feature not linked",
                 )
-                acs_results.append(
-                    ACResult(
-                        ac=ac_text,
-                        check_id="F-04",
-                        level=CheckLevel.FUNCTIONAL,
-                        status=Status.PASS if result else Status.FAIL,
-                        severity=Severity.HIGH,
-                        diagnosis=explanation,
-                        screenshot=current_screenshot,
+
+            # R-02: Skipped - too unstable with vision-based clicking
+            # Can be re-enabled when OmniParser has proper element labels
+            steps.append(
+                StepLog(
+                    "R-02 skipped",
+                    "info",
+                    {"reason": "vision-based navigation unstable"},
+                )
+            )
+
+            if platform == "web":
+                if not isinstance(executor, WebExecutor):
+                    raise ValueError("Expected WebExecutor for web platform")
+                r03 = _check_r03_web(executor, hints[0] if hints else "feature", steps)
+            else:
+                r03 = check_r03_feature_visible(hints[0] if hints else "feature", steps)
+
+            acs_results.append(r03)
+
+            # R-04: No feature flag blocking
+            r04 = check_r04_no_feature_flag(steps)
+            acs_results.append(r04)
+            if r04.status == Status.FAIL:
+                return _abort_report(
+                    run_id,
+                    story,
+                    acs_results,
+                    steps,
+                    start_time,
+                    "Feature blocked by feature flag",
+                )
+
+            # R-05: Click navigates correctly (only if navigation_action provided)
+            if not navigation_action:
+                steps.append(
+                    StepLog(
+                        "R-05 skipped",
+                        "info",
+                        {"reason": "no navigation_action provided"},
                     )
                 )
 
-        # F-05: State consistency (always run, no action needed)
-        f05 = check_f05_state_consistent(["header", "content", "status"], steps)
-        acs_results.append(f05)
+            if navigation_action and acs:
+                r05 = check_r05_click_navigates(navigation_action, acs[0], steps)
+                acs_results.append(r05)
+                if r05.status == Status.FAIL:
+                    return _abort_report(
+                        run_id,
+                        story,
+                        acs_results,
+                        steps,
+                        start_time,
+                        "Reachability failed: navigation action didn't work",
+                    )
 
-        # F-06: All buttons bound (only if explicitly requested - slow!)
-        if test_all_buttons:
-            f06 = check_f06_all_buttons_bound(steps)
-            acs_results.append(f06)
-
-    # 5. Edge Cases (simplified - only meaningful checks)
-    functional_passed = all(
-        ac.status != Status.FAIL
-        for ac in acs_results
-        if ac.level == CheckLevel.FUNCTIONAL
-    )
-
-    if functional_passed and "edge_cases" not in skip_levels:
-        # E-01: Empty state handling (just check current state)
-        e01 = check_e01_empty_state(
-            None, "Is there a helpful empty state or content visible?", steps
+        # 4. Functional (only meaningful checks)
+        reachability_passed = all(
+            ac.status != Status.FAIL
+            for ac in acs_results
+            if ac.level == CheckLevel.REACHABILITY
         )
-        acs_results.append(e01)
 
-        # Skip E-02 to E-05 - they need specific input fields which we don't know
-        # E-06: Persistence only if we have a navigation action
-        if navigation_action:
-            e06 = check_e06_persistence(
-                navigation_action,
-                "Is the feature still accessible after reload?",
-                steps,
+        if reachability_passed and "functional" not in skip_levels:
+            # F-01: Primary action causes change (only if we have an action)
+            if navigation_action:
+                f01 = check_f01_action_causes_change(navigation_action, steps)
+                acs_results.append(f01)
+
+            # F-04: Verify each AC is true on current screenshot (NO action, just verify)
+            # Take ONE screenshot and check all ACs against it
+            if acs:
+                current_screenshot = executor.take_screenshot("functional")
+
+                for ac_text in acs:
+                    result, explanation = ask_vision_bool(
+                        current_screenshot,
+                        f"Is the following true about this screenshot: '{ac_text}'?",
+                    )
+                    acs_results.append(
+                        ACResult(
+                            ac=ac_text,
+                            check_id="F-04",
+                            level=CheckLevel.FUNCTIONAL,
+                            status=Status.PASS if result else Status.FAIL,
+                            severity=Severity.HIGH,
+                            diagnosis=explanation,
+                            screenshot=current_screenshot,
+                        )
+                    )
+
+            # F-05: State consistency (always run, no action needed)
+            f05 = check_f05_state_consistent(["header", "content", "status"], steps)
+            acs_results.append(f05)
+
+            # F-06: All buttons bound (DANGEROUS - disabled by default)
+            if test_all_buttons:
+                logger.warning(
+                    "⚠️  F-06 (all buttons bound) is enabled. This will click every visible button "
+                    "which may trigger destructive actions (logout, delete, etc.). "
+                    "Consider using a fresh test environment."
+                )
+                steps.append(
+                    StepLog(
+                        "F-06 warning",
+                        "warn",
+                        {
+                            "message": "All buttons will be clicked - may trigger destructive actions"
+                        },
+                    )
+                )
+                f06 = check_f06_all_buttons_bound(steps)
+                acs_results.append(f06)
+            else:
+                steps.append(
+                    StepLog(
+                        "F-06 skipped",
+                        "info",
+                        {
+                            "reason": "Disabled by default (set test_all_buttons=True to enable)"
+                        },
+                    )
+                )
+
+        # 5. Edge Cases (simplified - only meaningful checks)
+        functional_passed = all(
+            ac.status != Status.FAIL
+            for ac in acs_results
+            if ac.level == CheckLevel.FUNCTIONAL
+        )
+
+        if functional_passed and "edge_cases" not in skip_levels:
+            # E-01: Empty state handling (just check current state)
+            e01 = check_e01_empty_state(
+                None, "Is there a helpful empty state or content visible?", steps
             )
-            acs_results.append(e06)
+            acs_results.append(e01)
 
-    # 6. Visual checks on final screenshot
-    if "visual" not in skip_levels:
-        final_screenshot = executor.take_screenshot("final")
-        acs_results.append(check_v01_contrast(final_screenshot))
-        acs_results.append(check_v02_text_truncated(final_screenshot))
-        acs_results.append(check_v03_element_overlaps(final_screenshot))
-        acs_results.append(check_v04_touch_targets(final_screenshot))
-        acs_results.append(check_v05_render_performance(steps))
-        acs_results.append(check_v06_ui_bleeding(final_screenshot))
+            # Skip E-02 to E-05 - they need specific input fields which we don't know
+            # E-06: Persistence only if we have a navigation action
+            if navigation_action:
+                e06 = check_e06_persistence(
+                    navigation_action,
+                    "Is the feature still accessible after reload?",
+                    steps,
+                )
+                acs_results.append(e06)
 
-    # 7. Cleanup
-    executor.stop_app(app_name)
+        # 6. Visual checks on final screenshot
+        if "visual" not in skip_levels:
+            final_screenshot = executor.take_screenshot("final")
+            acs_results.append(check_v01_contrast(final_screenshot))
+            acs_results.append(check_v02_text_truncated(final_screenshot))
+            acs_results.append(check_v03_element_overlaps(final_screenshot))
+            acs_results.append(check_v04_touch_targets(final_screenshot))
+            acs_results.append(check_v05_render_performance(steps))
+            acs_results.append(check_v06_ui_bleeding(final_screenshot))
 
-    # 8. Build report
-    duration = time.time() - start_time
-    report = build_report(run_id, story, acs_results, steps, duration)
-    return report.to_json()
+        # Build report (success path)
+        duration = time.time() - start_time
+        report = build_report(run_id, story, acs_results, steps, duration)
+        logger.info(
+            f"QA run complete: {run_id} | status={report.overall_status.name} | duration={duration:.1f}s | passed={report.acs_passed} failed={report.acs_failed}"
+        )
+        return report.to_json()
+
+    except Exception as e:
+        # Log the error and create error report
+        logger.exception(f"QA run failed: {e}")
+        steps.append(StepLog(f"Fatal error: {str(e)}", "error", {}))
+        duration = time.time() - start_time
+        report = build_report(run_id, story, acs_results, steps, duration)
+        return report.to_json()
+
+    finally:
+        # GUARANTEED cleanup - runs even on exception
+        if app_started:
+            try:
+                executor.stop_app(app_name)
+                logger.info(f"Cleanup successful: stopped {app_name}")
+            except Exception as cleanup_error:
+                logger.warning(f"Cleanup failed: {cleanup_error}")
 
 
 @mcp.tool()

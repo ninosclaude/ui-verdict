@@ -13,12 +13,17 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 
 from .executor_protocol import AppStartResult, PixelDiffResult
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -52,6 +57,9 @@ class WebExecutor:
         self._ready = False
         self._screenshot_dir = Path(tempfile.gettempdir()) / "qa_web_screenshots"
         self._screenshot_dir.mkdir(exist_ok=True)
+        self._stdout_queue: Queue[str] = Queue()
+        self._reader_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
 
     def is_available(self) -> bool:
         """Check if Midscene.js and Node.js are available."""
@@ -72,23 +80,76 @@ class WebExecutor:
         except Exception:
             return False
 
-    def _read_json_line(self) -> dict:
-        """Read lines until we get valid JSON, skip log messages."""
-        if self._node_process is None:
-            raise RuntimeError("Node process not started")
-        if self._node_process.stdout is None:
-            raise RuntimeError("Node process stdout not available")
+    def _start_stdout_reader(self) -> None:
+        """Start background thread to read stdout without blocking."""
 
-        while True:
-            line = self._node_process.stdout.readline()
-            if not line:
-                raise RuntimeError("Node process closed unexpectedly")
+        def reader():
+            while self._node_process and self._node_process.poll() is None:
+                try:
+                    if self._node_process.stdout is None:
+                        break
+                    line = self._node_process.stdout.readline()
+                    if not line:
+                        break
+                    self._stdout_queue.put(line)
+                except Exception:
+                    break
+
+        self._reader_thread = threading.Thread(target=reader, daemon=True)
+        self._reader_thread.start()
+
+    def _start_stderr_reader(self) -> None:
+        """Start background thread to read and log stderr."""
+
+        def reader():
+            while self._node_process and self._node_process.poll() is None:
+                try:
+                    if self._node_process.stderr is None:
+                        break
+                    line = self._node_process.stderr.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if line:
+                        # Log Node.js stderr as warnings
+                        logger.warning(f"[node] {line}")
+                except Exception:
+                    break
+
+        self._stderr_thread = threading.Thread(target=reader, daemon=True)
+        self._stderr_thread.start()
+
+    def _read_line_with_timeout(self, timeout_seconds: float = 30.0) -> str:
+        """Read a line from stdout with timeout."""
+        try:
+            return self._stdout_queue.get(timeout=timeout_seconds)
+        except Empty:
+            raise TimeoutError(
+                f"Node.js process did not respond within {timeout_seconds}s"
+            )
+
+    def _read_json_line(self, timeout_seconds: float = 30.0) -> dict:
+        """Read lines until we get valid JSON, skip log messages."""
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"No JSON response within {timeout_seconds}s")
+
+            try:
+                line = self._read_line_with_timeout(remaining)
+            except TimeoutError:
+                raise
+
             line = line.strip()
             if not line:
                 continue
             if not line.startswith("{"):
-                continue  # Skip non-JSON log messages
+                logger.debug(f"Skipping non-JSON: {line[:100]}")
+                continue
             return json.loads(line)
+
+        raise TimeoutError(f"No JSON response within {timeout_seconds}s")
 
     def _ensure_node_process(self) -> None:
         """Start Node.js subprocess if not running."""
@@ -99,6 +160,11 @@ class WebExecutor:
         ):
             return  # Already running and ready
 
+        # Kill any existing process
+        if self._node_process is not None:
+            self._node_process.terminate()
+            self._node_process = None
+
         midscene_dir = Path(__file__).parent / "midscene"
 
         self._node_process = subprocess.Popen(
@@ -108,15 +174,27 @@ class WebExecutor:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            bufsize=1,  # Line buffered
         )
 
-        # Consume ready signal
-        ready_msg = self._read_json_line()
-        if not ready_msg.get("ready"):
-            raise RuntimeError(f"Unexpected startup message: {ready_msg}")
-        self._ready = True
+        # Start background reader threads
+        self._start_stdout_reader()
+        self._start_stderr_reader()
 
-    def _send_command(self, command: dict) -> dict:
+        # Wait for ready signal with timeout
+        try:
+            ready_msg = self._read_json_line(timeout_seconds=10.0)
+            if not ready_msg.get("ready"):
+                raise RuntimeError(f"Invalid startup message: {ready_msg}")
+            self._ready = True
+        except TimeoutError as e:
+            self._node_process.terminate()
+            self._node_process = None
+            raise RuntimeError(f"Node.js process failed to start: {e}")
+
+    def _send_command(
+        self, command: dict, timeout_seconds: float | None = None
+    ) -> dict:
         """Send command to Node.js process and get response."""
         self._ensure_node_process()
 
@@ -125,13 +203,18 @@ class WebExecutor:
         if self._node_process.stdin is None:
             raise RuntimeError("Node process stdin not available")
 
+        timeout = timeout_seconds or (self.config.timeout_ms / 1000)
+
         # Send command
         cmd_json = json.dumps(command) + "\n"
+        logger.debug(f"Sending command: {command['action']}")
         self._node_process.stdin.write(cmd_json)
         self._node_process.stdin.flush()
 
-        # Read response (skip non-JSON log lines)
-        return self._read_json_line()
+        # Read response with timeout
+        response = self._read_json_line(timeout_seconds=timeout)
+        logger.debug(f"Command response: success={response.get('success')}")
+        return response
 
     def take_screenshot(self, prefix: str = "qa") -> str:
         """Take screenshot of browser, return local path."""
@@ -236,6 +319,7 @@ class WebExecutor:
 
         For web executor, target should be a URL.
         """
+        logger.info(f"Starting browser: url={target}")
         try:
             self._ensure_node_process()
 
@@ -264,21 +348,38 @@ class WebExecutor:
             return AppStartResult(False, None, str(e))
 
     def stop_app(self, name: str) -> None:
-        """Close browser."""
-        if self._node_process is not None:
-            try:
-                self._send_command({"action": "close"})
-            except:
-                pass
-            self._node_process.terminate()
-            self._node_process = None
-            self._ready = False
+        """Close browser and cleanup."""
+        logger.info(f"Stopping browser: {name}")
+        if self._node_process is None:
+            return
+
+        try:
+            # Try graceful close with short timeout
+            self._send_command({"action": "close"}, timeout_seconds=5.0)
+        except Exception:
+            pass
+
+        # Force terminate
+        self._node_process.terminate()
+        try:
+            self._node_process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            self._node_process.kill()
+
+        self._node_process = None
+        self._ready = False
 
     def __del__(self):
         """Cleanup Node.js process on destruction."""
-        if self._node_process is not None:
-            self._node_process.terminate()
-            self._ready = False
+        if self._node_process is None:
+            return
+
+        self._node_process.terminate()
+        try:
+            self._node_process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            self._node_process.kill()
+        self._ready = False
 
 
 # Factory function

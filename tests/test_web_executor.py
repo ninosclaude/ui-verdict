@@ -55,7 +55,9 @@ class TestWebExecutorUnit:
         process.poll.return_value = None
         process.stdin = MagicMock()
         process.stdout = MagicMock()
+        # Mock stderr.readline() to return empty string (EOF) to prevent spam
         process.stderr = MagicMock()
+        process.stderr.readline.return_value = ""
         return process
 
     def test_is_available_checks_node_and_package(self, executor):
@@ -93,57 +95,56 @@ class TestWebExecutorUnit:
             result = executor.is_available()
             assert result is False
 
-    def test_read_json_line_skips_non_json(self, executor, mock_node_process):
+    def test_read_json_line_skips_non_json(self, executor):
         """Test _read_json_line skips non-JSON log messages."""
-        executor._node_process = mock_node_process
+        # Put lines directly into queue (simulating background thread)
+        executor._stdout_queue.put("Starting browser...\n")
+        executor._stdout_queue.put("Browser initialized\n")
+        executor._stdout_queue.put('{"ready": true}\n')
 
-        # Simulate lines with logs and JSON
-        mock_node_process.stdout.readline.side_effect = [
-            "Starting browser...\n",
-            "Browser initialized\n",
-            '{"ready": true}\n',
-        ]
-
-        result = executor._read_json_line()
+        result = executor._read_json_line(timeout_seconds=1.0)
 
         assert result == {"ready": True}
-        assert mock_node_process.stdout.readline.call_count == 3
 
-    def test_read_json_line_empty_lines(self, executor, mock_node_process):
+    def test_read_json_line_empty_lines(self, executor):
         """Test _read_json_line skips empty lines."""
-        executor._node_process = mock_node_process
+        # Put lines directly into queue
+        executor._stdout_queue.put("\n")
+        executor._stdout_queue.put("   \n")
+        executor._stdout_queue.put('{"success": true}\n')
 
-        mock_node_process.stdout.readline.side_effect = [
-            "\n",
-            "   \n",
-            '{"success": true}\n',
-        ]
-
-        result = executor._read_json_line()
+        result = executor._read_json_line(timeout_seconds=1.0)
 
         assert result == {"success": True}
 
-    def test_read_json_line_no_process(self, executor):
-        """Test _read_json_line raises when process not started."""
-        with pytest.raises(RuntimeError, match="Node process not started"):
-            executor._read_json_line()
+    def test_read_json_line_timeout(self, executor):
+        """Test _read_json_line raises TimeoutError when no data arrives."""
+        # Empty queue - should timeout
+        with pytest.raises(TimeoutError):
+            executor._read_json_line(timeout_seconds=0.1)
 
-    def test_read_json_line_process_closed(self, executor, mock_node_process):
-        """Test _read_json_line raises when process closes."""
-        executor._node_process = mock_node_process
-        mock_node_process.stdout.readline.return_value = ""
+    def test_read_line_with_timeout(self, executor):
+        """Test _read_line_with_timeout reads from queue."""
+        executor._stdout_queue.put("test line\n")
 
-        with pytest.raises(RuntimeError, match="Node process closed unexpectedly"):
-            executor._read_json_line()
+        result = executor._read_line_with_timeout(timeout_seconds=1.0)
+
+        assert result == "test line\n"
+
+    def test_read_line_with_timeout_empty_queue(self, executor):
+        """Test _read_line_with_timeout raises TimeoutError on empty queue."""
+        with pytest.raises(TimeoutError, match="did not respond within"):
+            executor._read_line_with_timeout(timeout_seconds=0.1)
 
     def test_send_command_returns_json(self, executor, mock_node_process):
         """Test _send_command sends and receives JSON."""
         executor._node_process = mock_node_process
         executor._ready = True
 
-        mock_node_process.stdout.readline.return_value = '{"success": true}\n'
+        # Put response into queue
+        executor._stdout_queue.put('{"success": true}\n')
 
-        result = executor._send_command({"action": "test"})
+        result = executor._send_command({"action": "test"}, timeout_seconds=1.0)
 
         assert result == {"success": True}
         mock_node_process.stdin.write.assert_called_once_with('{"action": "test"}\n')
@@ -158,9 +159,18 @@ class TestWebExecutorUnit:
                 executor._node_process = MagicMock()
                 executor._node_process.stdin = MagicMock()
 
-                executor._send_command({"action": "test"})
+                executor._send_command({"action": "test"}, timeout_seconds=1.0)
 
                 mock_ensure.assert_called_once()
+
+    def test_send_command_timeout(self, executor, mock_node_process):
+        """Test _send_command respects timeout_seconds parameter."""
+        executor._node_process = mock_node_process
+        executor._ready = True
+
+        # Don't put anything in queue - should timeout
+        with pytest.raises(TimeoutError):
+            executor._send_command({"action": "test"}, timeout_seconds=0.1)
 
     def test_take_screenshot_returns_path(self, executor):
         """Test take_screenshot returns local file path."""
@@ -351,8 +361,9 @@ class TestWebExecutorUnit:
         with patch.object(executor, "_send_command") as mock_send:
             executor.stop_app("test-app")
 
-            mock_send.assert_called_once_with({"action": "close"})
+            mock_send.assert_called_once_with({"action": "close"}, timeout_seconds=5.0)
             mock_node_process.terminate.assert_called_once()
+            mock_node_process.wait.assert_called_once_with(timeout=5.0)
             assert executor._node_process is None
             assert executor._ready is False
 
@@ -364,6 +375,7 @@ class TestWebExecutorUnit:
             executor.stop_app("test-app")
 
             mock_node_process.terminate.assert_called_once()
+            mock_node_process.wait.assert_called_once_with(timeout=5.0)
 
     def test_focus_window_noop(self, executor):
         """Test focus_window is no-op for web."""
@@ -384,24 +396,36 @@ class TestWebExecutorUnit:
         """Test _ensure_node_process starts new process."""
         with patch("subprocess.Popen") as mock_popen:
             mock_process = MagicMock()
-            mock_process.stdout.readline.return_value = '{"ready": true}\n'
+            mock_process.poll.return_value = None  # Process running
             mock_popen.return_value = mock_process
 
-            executor._ensure_node_process()
+            # Mock the background thread starts to prevent stderr spam
+            with patch.object(executor, "_start_stdout_reader"):
+                with patch.object(executor, "_start_stderr_reader"):
+                    # Simulate ready message in queue
+                    executor._stdout_queue.put('{"ready": true}\n')
 
-            mock_popen.assert_called_once()
-            assert executor._node_process is mock_process
-            assert executor._ready is True
+                    executor._ensure_node_process()
+
+                    mock_popen.assert_called_once()
+                    assert executor._node_process is mock_process
+                    assert executor._ready is True
 
     def test_ensure_node_process_invalid_startup(self, executor):
         """Test _ensure_node_process raises on invalid startup message."""
         with patch("subprocess.Popen") as mock_popen:
             mock_process = MagicMock()
-            mock_process.stdout.readline.return_value = '{"error": "failed"}\n'
+            mock_process.poll.return_value = None
             mock_popen.return_value = mock_process
 
-            with pytest.raises(RuntimeError, match="Unexpected startup message"):
-                executor._ensure_node_process()
+            # Mock the background thread starts to prevent stderr spam
+            with patch.object(executor, "_start_stdout_reader"):
+                with patch.object(executor, "_start_stderr_reader"):
+                    # Put invalid message in queue
+                    executor._stdout_queue.put('{"error": "failed"}\n')
+
+                    with pytest.raises(RuntimeError, match="Invalid startup message"):
+                        executor._ensure_node_process()
 
     def test_destructor_cleanup(self, executor, mock_node_process):
         """Test __del__ cleans up Node.js process."""
@@ -411,6 +435,7 @@ class TestWebExecutorUnit:
         executor.__del__()
 
         mock_node_process.terminate.assert_called_once()
+        mock_node_process.wait.assert_called_once_with(timeout=5.0)
         assert executor._ready is False
 
     def test_screenshot_dir_created(self, executor):

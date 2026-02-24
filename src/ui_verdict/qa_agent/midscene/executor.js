@@ -44,6 +44,14 @@ function logDebug(message, ...args) {
     console.error('[executor]', message, ...args);
 }
 
+// Error logging to stderr with full context
+function logError(context, error) {
+    console.error(`[${context}] ${error.message || error}`);
+    if (error.stack) {
+        console.error(error.stack);
+    }
+}
+
 // Initialize Midscene AI agent
 async function initAiAgent() {
     if (!page) return null;
@@ -81,6 +89,7 @@ const handlers = {
             
             output({ success: true, url });
         } catch (error) {
+            logError('launch', error);
             output({ success: false, error: error.message });
         }
     },
@@ -91,6 +100,7 @@ const handlers = {
             await page.screenshot({ path, fullPage: false });
             output({ success: true, path });
         } catch (error) {
+            logError('screenshot', error);
             output({ success: false, error: error.message });
         }
     },
@@ -134,6 +144,7 @@ const handlers = {
             
             output({ success: false, error: `Could not parse instruction: ${instruction}` });
         } catch (error) {
+            logError('aiAction', error);
             output({ success: false, error: error.message });
         }
     },
@@ -152,6 +163,7 @@ const handlers = {
             // Fallback: can't answer without AI
             output({ success: false, error: 'AI agent not available for aiBoolean' });
         } catch (error) {
+            logError('aiBoolean', error);
             output({ success: false, error: error.message });
         }
     },
@@ -169,6 +181,7 @@ const handlers = {
             
             output({ success: false, error: 'AI agent not available for aiQuery' });
         } catch (error) {
+            logError('aiQuery', error);
             output({ success: false, error: error.message });
         }
     },
@@ -219,6 +232,7 @@ const handlers = {
             
             output({ success: true, keys: combo });
         } catch (error) {
+            logError('keyboard', error);
             output({ success: false, error: error.message });
         }
     },
@@ -229,6 +243,7 @@ const handlers = {
             await page.keyboard.type(text);
             output({ success: true, text });
         } catch (error) {
+            logError('type', error);
             output({ success: false, error: error.message });
         }
     },
@@ -239,6 +254,7 @@ const handlers = {
             await page.goto(url, { waitUntil: 'networkidle' });
             output({ success: true, url });
         } catch (error) {
+            logError('goto', error);
             output({ success: false, error: error.message });
         }
     },
@@ -249,6 +265,7 @@ const handlers = {
             await page.waitForSelector(selector, { timeout });
             output({ success: true, selector });
         } catch (error) {
+            logError('waitFor', error);
             output({ success: false, error: error.message });
         }
     },
@@ -263,6 +280,7 @@ const handlers = {
             }
             output({ success: true });
         } catch (error) {
+            logError('close', error);
             output({ success: false, error: error.message });
         }
     },
@@ -287,6 +305,7 @@ rl.on('line', async (line) => {
         
         await handler(command);
     } catch (error) {
+        logError('command-handler', error);
         output({ success: false, error: error.message });
     }
 });

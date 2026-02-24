@@ -30,11 +30,70 @@ from .executor import (
     run_in_vm,
 )
 from .vision import ask_vision, ask_vision_bool
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
+
+def wait_for_stable_ui(
+    executor_take_screenshot: Callable[[str], str],
+    prefix: str = "wait",
+    max_wait_seconds: float = 5.0,
+    stability_threshold: float = 0.001,
+    poll_interval: float = 0.2,
+) -> str:
+    """Wait for UI to stabilize by monitoring pixel changes.
+
+    Takes screenshots in a loop until two consecutive screenshots
+    have less than stability_threshold pixel difference.
+
+    Args:
+        executor_take_screenshot: Function to call to take screenshot
+        prefix: Prefix for screenshot filenames
+        max_wait_seconds: Maximum time to wait for stability
+        stability_threshold: Maximum change ratio to consider stable
+        poll_interval: Time between screenshots
+
+    Returns:
+        Path to final stable screenshot
+    """
+    start_time = time.time()
+    prev_screenshot = executor_take_screenshot(f"{prefix}_0")
+    iteration = 1
+
+    while time.time() - start_time < max_wait_seconds:
+        time.sleep(poll_interval)
+        curr_screenshot = executor_take_screenshot(f"{prefix}_{iteration}")
+
+        try:
+            diff_result = get_pixel_diff(prev_screenshot, curr_screenshot)
+            change_ratio = diff_result["change_ratio"]
+
+            logger.debug(
+                f"UI stability check {iteration}: change_ratio={change_ratio:.4f}"
+            )
+
+            if change_ratio < stability_threshold:
+                logger.debug(f"UI stable after {time.time() - start_time:.2f}s")
+                return curr_screenshot
+
+            prev_screenshot = curr_screenshot
+            iteration += 1
+
+        except Exception as e:
+            logger.warning(f"Pixel diff failed: {e}, continuing...")
+            prev_screenshot = curr_screenshot
+            iteration += 1
+
+    logger.warning(
+        f"UI did not stabilize within {max_wait_seconds}s, using last screenshot"
+    )
+    return prev_screenshot
 
 
 def _sanitize_for_filename(text: str, max_length: int = 20) -> str:
@@ -356,7 +415,6 @@ def check_r02_reachable_in_clicks(
         # Try to click suggested element
         try:
             execute_action(f"click:{click_suggestion}")
-            time.sleep(0.5)
         except Exception as e:
             steps.append(
                 StepLog(
@@ -376,7 +434,7 @@ def check_r02_reachable_in_clicks(
                 screenshot=screenshot,
             )
 
-        screenshot = take_screenshot(f"r02_click{click_num}")
+        screenshot = wait_for_stable_ui(take_screenshot, prefix=f"r02_click{click_num}")
 
         # Check if we reached the target
         result, explanation = ask_vision_bool(
@@ -475,8 +533,7 @@ def check_r05_click_navigates(
             screenshot=before,
         )
 
-    time.sleep(1.0)  # Give UI time to fully render (dialogs, animations)
-    after = take_screenshot("r05_after")
+    after = wait_for_stable_ui(take_screenshot, prefix="r05_after")
 
     diff = get_pixel_diff(before, after)
 
@@ -545,8 +602,7 @@ def check_f01_action_causes_change(action: str, steps: list[StepLog]) -> ACResul
             screenshot=before,
         )
 
-    time.sleep(0.5)
-    after = take_screenshot("f01_after")
+    after = wait_for_stable_ui(take_screenshot, prefix="f01_after")
 
     diff = get_pixel_diff(before, after)
     passed = diff["change_ratio"] > 0.001
@@ -593,8 +649,9 @@ def check_f04_result_matches_ac(
             screenshot=before,
         )
 
-    time.sleep(timeout_ms / 1000.0)
-    after = take_screenshot("f04_after")
+    after = wait_for_stable_ui(
+        take_screenshot, prefix="f04_after", max_wait_seconds=timeout_ms / 1000.0
+    )
 
     diff = get_pixel_diff(before, after)
 
@@ -1025,14 +1082,14 @@ def check_e01_empty_state(
 ) -> ACResult:
     """E-01: Leerer State wird sinnvoll angezeigt."""
 
+    screenshot = take_screenshot("e01")
+
     if setup_action:
         try:
             execute_action(setup_action)
-            time.sleep(0.5)
+            screenshot = wait_for_stable_ui(take_screenshot, prefix="e01")
         except:
             pass
-
-    screenshot = take_screenshot("e01")
     result, explanation = ask_vision_bool(screenshot, verify)
 
     steps.append(
@@ -1077,7 +1134,6 @@ def check_e02_long_input(input_field_hint: str, steps: list[StepLog]) -> ACResul
     # Type long text
     try:
         execute_action(f"type:{long_text}")
-        time.sleep(0.5)
     except Exception as e:
         steps.append(StepLog("Type long text", "fail", {"error": str(e)}))
         return ACResult(
@@ -1090,7 +1146,7 @@ def check_e02_long_input(input_field_hint: str, steps: list[StepLog]) -> ACResul
             screenshot=screenshot,
         )
 
-    after = take_screenshot("e02_after")
+    after = wait_for_stable_ui(take_screenshot, prefix="e02_after")
 
     # Check for overflow, truncation, or UI breaking
     result, explanation = ask_vision_bool(
@@ -1147,7 +1203,6 @@ def check_e03_special_chars(input_field_hint: str, steps: list[StepLog]) -> ACRe
     # Type special characters
     try:
         execute_action(f"type:{special_text}")
-        time.sleep(0.5)
     except Exception as e:
         steps.append(StepLog("Type special chars", "fail", {"error": str(e)}))
         return ACResult(
@@ -1160,7 +1215,7 @@ def check_e03_special_chars(input_field_hint: str, steps: list[StepLog]) -> ACRe
             screenshot=screenshot,
         )
 
-    after = take_screenshot("e03_after")
+    after = wait_for_stable_ui(take_screenshot, prefix="e03_after")
 
     # Check if special characters rendered correctly
     result, explanation = ask_vision_bool(
@@ -1198,7 +1253,6 @@ def check_e04_error_state(trigger_action: str, steps: list[StepLog]) -> ACResult
     # Trigger error condition
     try:
         execute_action(trigger_action)
-        time.sleep(0.5)
     except Exception as e:
         steps.append(
             StepLog(f"Trigger error: {trigger_action}", "fail", {"error": str(e)})
@@ -1213,7 +1267,7 @@ def check_e04_error_state(trigger_action: str, steps: list[StepLog]) -> ACResult
             screenshot=screenshot,
         )
 
-    after = take_screenshot("e04_after")
+    after = wait_for_stable_ui(take_screenshot, prefix="e04_after")
 
     # Check if error message shown
     result, explanation = ask_vision_bool(
@@ -1246,9 +1300,8 @@ def check_e05_double_submit(submit_action: str, steps: list[StepLog]) -> ACResul
     # Click submit twice rapidly
     try:
         execute_action(submit_action)
-        time.sleep(0.05)  # Very short delay
+        time.sleep(0.05)  # Very short delay - intentional for double-submit test
         execute_action(submit_action)
-        time.sleep(0.5)
     except Exception as e:
         steps.append(StepLog("Double submit", "fail", {"error": str(e)}))
         return ACResult(
@@ -1261,7 +1314,7 @@ def check_e05_double_submit(submit_action: str, steps: list[StepLog]) -> ACResul
             screenshot=before,
         )
 
-    after = take_screenshot("e05_after")
+    after = wait_for_stable_ui(take_screenshot, prefix="e05_after")
 
     # Check if duplicate was prevented
     result, explanation = ask_vision_bool(
@@ -1295,7 +1348,6 @@ def check_e06_persistence(action: str, verify: str, steps: list[StepLog]) -> ACR
     # Do action
     try:
         execute_action(action)
-        time.sleep(0.5)
     except Exception as e:
         return ACResult(
             ac="State persists after reload",
@@ -1306,7 +1358,7 @@ def check_e06_persistence(action: str, verify: str, steps: list[StepLog]) -> ACR
             diagnosis=f"Setup action failed: {e}",
         )
 
-    before = take_screenshot("e06_before")
+    before = wait_for_stable_ui(take_screenshot, prefix="e06_before")
 
     # Simulate reload (F5 or Ctrl+R)
     try:
@@ -1440,7 +1492,6 @@ def check_v04_touch_targets(screenshot_path: str) -> ACResult:
 def check_v05_render_performance(steps: list[StepLog]) -> ACResult:
     """V-05: Render-Performance (Screenshot-Loop, >500ms = fail)."""
 
-    # Measure time to take stable screenshot after action
     action = "key:space"  # Simple action to trigger render
     before = take_screenshot("v05_before")
 
@@ -1451,22 +1502,14 @@ def check_v05_render_performance(steps: list[StepLog]) -> ACResult:
     except:
         pass  # Action might fail, focus on render time
 
-    # Wait for stable frame (no changes between screenshots)
-    max_wait = 2.0
-    stable_threshold = 0.001
-    last_screenshot = None
-
-    while (time.time() - start_time) < max_wait:
-        time.sleep(0.05)
-        current = take_screenshot("v05_current")
-
-        if last_screenshot:
-            diff = get_pixel_diff(last_screenshot, current)
-            if diff["change_ratio"] < stable_threshold:
-                # Frame is stable
-                break
-
-        last_screenshot = current
+    # Use smart wait with tight timing for performance measurement
+    last_screenshot = wait_for_stable_ui(
+        take_screenshot,
+        prefix="v05_perf",
+        max_wait_seconds=2.0,
+        stability_threshold=0.001,
+        poll_interval=0.05,
+    )
 
     elapsed_ms = int((time.time() - start_time) * 1000)
     passed = elapsed_ms <= 500
