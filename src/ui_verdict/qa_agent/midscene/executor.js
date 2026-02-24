@@ -12,6 +12,7 @@
  * - launch: Open browser and navigate to URL
  * - screenshot: Take screenshot
  * - aiAction: Execute natural language action via Midscene
+ * - aiBoolean: Ask yes/no question via Midscene
  * - keyboard: Press keyboard keys
  * - type: Type text
  * - goto: Navigate to URL
@@ -19,15 +20,36 @@
  */
 
 import { chromium, firefox, webkit } from 'playwright';
+import { PlaywrightAgent } from '@midscene/web/playwright';
 import readline from 'readline';
 
-// Browser instance
+// Browser and Midscene agent instances
 let browser = null;
 let page = null;
+let aiAgent = null;
 
-// Response helper
-function respond(data) {
-    console.log(JSON.stringify(data));
+// Output JSON to stdout (protocol channel)
+function output(data) {
+    process.stdout.write(JSON.stringify(data) + '\n');
+}
+
+// Debug logging to stderr (doesn't interfere with JSON protocol)
+function logDebug(message, ...args) {
+    console.error('[executor]', message, ...args);
+}
+
+// Initialize Midscene AI agent
+async function initAiAgent() {
+    if (!page) return null;
+    
+    try {
+        // Create PlaywrightAgent instance from page
+        aiAgent = new PlaywrightAgent(page);
+        return aiAgent;
+    } catch (error) {
+        logDebug('Failed to initialize AI agent:', error.message);
+        return null;
+    }
 }
 
 // Command handlers
@@ -48,9 +70,12 @@ const handlers = {
             
             await page.goto(url, { waitUntil: 'networkidle' });
             
-            respond({ success: true, url });
+            // Initialize AI agent after page is ready
+            await initAiAgent();
+            
+            output({ success: true, url });
         } catch (error) {
-            respond({ success: false, error: error.message });
+            output({ success: false, error: error.message });
         }
     },
 
@@ -58,9 +83,9 @@ const handlers = {
         try {
             if (!page) throw new Error('No page open');
             await page.screenshot({ path, fullPage: false });
-            respond({ success: true, path });
+            output({ success: true, path });
         } catch (error) {
-            respond({ success: false, error: error.message });
+            output({ success: false, error: error.message });
         }
     },
 
@@ -68,31 +93,77 @@ const handlers = {
         try {
             if (!page) throw new Error('No page open');
             
-            // TODO: Integrate Midscene.js aiAction
-            // For now, use simple Playwright locator
-            // This will be replaced with actual Midscene integration
-            
-            // Parse simple click instructions
-            const clickMatch = instruction.match(/click on ['"](.+)['"]/i);
-            if (clickMatch) {
-                const target = clickMatch[1];
-                await page.getByText(target, { exact: false }).first().click();
-                respond({ success: true, action: 'click', target });
+            if (aiAgent) {
+                // Use Midscene AI action
+                await aiAgent.aiAction(instruction);
+                output({ success: true, action: 'aiAction', instruction });
                 return;
             }
             
-            // Parse simple type instructions
+            // Fallback to simple Playwright locator
+            const clickMatch = instruction.match(/click (?:on |the )?['"]?([^'"]+)['"]?/i);
+            if (clickMatch) {
+                const target = clickMatch[1].trim();
+                // Try multiple strategies
+                try {
+                    await page.getByRole('button', { name: target }).first().click({ timeout: 5000 });
+                } catch {
+                    try {
+                        await page.getByText(target, { exact: false }).first().click({ timeout: 5000 });
+                    } catch {
+                        await page.locator(`text=${target}`).first().click({ timeout: 5000 });
+                    }
+                }
+                output({ success: true, action: 'click', target });
+                return;
+            }
+            
             const typeMatch = instruction.match(/type ['"](.+)['"]/i);
             if (typeMatch) {
                 const text = typeMatch[1];
                 await page.keyboard.type(text);
-                respond({ success: true, action: 'type', text });
+                output({ success: true, action: 'type', text });
                 return;
             }
             
-            respond({ success: false, error: `Unknown instruction: ${instruction}` });
+            output({ success: false, error: `Could not parse instruction: ${instruction}` });
         } catch (error) {
-            respond({ success: false, error: error.message });
+            output({ success: false, error: error.message });
+        }
+    },
+
+    async aiBoolean({ question }) {
+        try {
+            if (!page) throw new Error('No page open');
+            
+            if (aiAgent) {
+                // Use Midscene AI boolean
+                const result = await aiAgent.aiBoolean(question);
+                output({ success: true, result, question });
+                return;
+            }
+            
+            // Fallback: can't answer without AI
+            output({ success: false, error: 'AI agent not available for aiBoolean' });
+        } catch (error) {
+            output({ success: false, error: error.message });
+        }
+    },
+
+    async aiQuery({ query }) {
+        try {
+            if (!page) throw new Error('No page open');
+            
+            if (aiAgent) {
+                // Use Midscene AI query
+                const result = await aiAgent.aiQuery(query);
+                output({ success: true, result, query });
+                return;
+            }
+            
+            output({ success: false, error: 'AI agent not available for aiQuery' });
+        } catch (error) {
+            output({ success: false, error: error.message });
         }
     },
 
@@ -107,6 +178,17 @@ const handlers = {
                 'shift': 'Shift',
                 'meta': 'Meta',
                 'cmd': 'Meta',
+                'enter': 'Enter',
+                'escape': 'Escape',
+                'esc': 'Escape',
+                'tab': 'Tab',
+                'space': 'Space',
+                'backspace': 'Backspace',
+                'delete': 'Delete',
+                'up': 'ArrowUp',
+                'down': 'ArrowDown',
+                'left': 'ArrowLeft',
+                'right': 'ArrowRight',
             };
             
             const parts = keys.toLowerCase().split('+');
@@ -117,16 +199,21 @@ const handlers = {
                 if (keyMap[part]) {
                     modifiers.push(keyMap[part]);
                 } else {
-                    key = part.length === 1 ? part : part.charAt(0).toUpperCase() + part.slice(1);
+                    // Handle F-keys and single characters
+                    if (part.match(/^f\d+$/)) {
+                        key = part.toUpperCase();
+                    } else {
+                        key = part.length === 1 ? part : part.charAt(0).toUpperCase() + part.slice(1);
+                    }
                 }
             }
             
             const combo = [...modifiers, key].join('+');
             await page.keyboard.press(combo);
             
-            respond({ success: true, keys: combo });
+            output({ success: true, keys: combo });
         } catch (error) {
-            respond({ success: false, error: error.message });
+            output({ success: false, error: error.message });
         }
     },
 
@@ -134,9 +221,9 @@ const handlers = {
         try {
             if (!page) throw new Error('No page open');
             await page.keyboard.type(text);
-            respond({ success: true, text });
+            output({ success: true, text });
         } catch (error) {
-            respond({ success: false, error: error.message });
+            output({ success: false, error: error.message });
         }
     },
 
@@ -144,22 +231,33 @@ const handlers = {
         try {
             if (!page) throw new Error('No page open');
             await page.goto(url, { waitUntil: 'networkidle' });
-            respond({ success: true, url });
+            output({ success: true, url });
         } catch (error) {
-            respond({ success: false, error: error.message });
+            output({ success: false, error: error.message });
+        }
+    },
+
+    async waitFor({ selector, timeout = 30000 }) {
+        try {
+            if (!page) throw new Error('No page open');
+            await page.waitForSelector(selector, { timeout });
+            output({ success: true, selector });
+        } catch (error) {
+            output({ success: false, error: error.message });
         }
     },
 
     async close() {
         try {
+            aiAgent = null;
             if (browser) {
                 await browser.close();
                 browser = null;
                 page = null;
             }
-            respond({ success: true });
+            output({ success: true });
         } catch (error) {
-            respond({ success: false, error: error.message });
+            output({ success: false, error: error.message });
         }
     },
 };
@@ -177,13 +275,13 @@ rl.on('line', async (line) => {
         const handler = handlers[command.action];
         
         if (!handler) {
-            respond({ success: false, error: `Unknown action: ${command.action}` });
+            output({ success: false, error: `Unknown action: ${command.action}` });
             return;
         }
         
         await handler(command);
     } catch (error) {
-        respond({ success: false, error: error.message });
+        output({ success: false, error: error.message });
     }
 });
 
@@ -199,4 +297,4 @@ process.on('SIGINT', async () => {
 });
 
 // Signal ready
-respond({ ready: true, version: '1.0.0' });
+output({ ready: true, version: '1.0.0' });

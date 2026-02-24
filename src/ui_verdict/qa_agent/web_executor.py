@@ -24,6 +24,7 @@ from .executor_protocol import AppStartResult, PixelDiffResult
 @dataclass
 class WebConfig:
     """Web executor configuration."""
+
     browser: str = "chromium"  # chromium, firefox, webkit
     headless: bool = True
     viewport_width: int = 1920
@@ -33,13 +34,13 @@ class WebConfig:
 
 class WebExecutor:
     """Executor for web apps via Midscene.js/Playwright.
-    
+
     Implements ExecutorProtocol via duck typing.
-    
+
     Architecture:
     - Python: orchestration, screenshot analysis, reporting
     - Node.js subprocess: Midscene.js for browser control
-    
+
     Communication:
     - Python -> Node: JSON commands via stdin
     - Node -> Python: JSON responses via stdout
@@ -48,6 +49,7 @@ class WebExecutor:
     def __init__(self, config: WebConfig | None = None):
         self.config = config or WebConfig()
         self._node_process: subprocess.Popen | None = None
+        self._ready = False
         self._screenshot_dir = Path(tempfile.gettempdir()) / "qa_web_screenshots"
         self._screenshot_dir.mkdir(exist_ok=True)
 
@@ -56,30 +58,49 @@ class WebExecutor:
         try:
             # Check Node.js
             result = subprocess.run(
-                ["node", "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5
+                ["node", "--version"], capture_output=True, text=True, timeout=5
             )
             if result.returncode != 0:
                 return False
-            
+
             # Check if Midscene is installed (look for package.json in project)
             midscene_dir = Path(__file__).parent / "midscene"
             if not (midscene_dir / "package.json").exists():
                 return False
-            
+
             return True
         except Exception:
             return False
 
+    def _read_json_line(self) -> dict:
+        """Read lines until we get valid JSON, skip log messages."""
+        if self._node_process is None:
+            raise RuntimeError("Node process not started")
+        if self._node_process.stdout is None:
+            raise RuntimeError("Node process stdout not available")
+
+        while True:
+            line = self._node_process.stdout.readline()
+            if not line:
+                raise RuntimeError("Node process closed unexpectedly")
+            line = line.strip()
+            if not line:
+                continue
+            if not line.startswith("{"):
+                continue  # Skip non-JSON log messages
+            return json.loads(line)
+
     def _ensure_node_process(self) -> None:
         """Start Node.js subprocess if not running."""
-        if self._node_process is not None and self._node_process.poll() is None:
-            return  # Already running
-        
+        if (
+            self._node_process is not None
+            and self._node_process.poll() is None
+            and self._ready
+        ):
+            return  # Already running and ready
+
         midscene_dir = Path(__file__).parent / "midscene"
-        
+
         self._node_process = subprocess.Popen(
             ["node", "executor.js"],
             cwd=midscene_dir,
@@ -89,35 +110,44 @@ class WebExecutor:
             text=True,
         )
 
+        # Consume ready signal
+        ready_msg = self._read_json_line()
+        if not ready_msg.get("ready"):
+            raise RuntimeError(f"Unexpected startup message: {ready_msg}")
+        self._ready = True
+
     def _send_command(self, command: dict) -> dict:
         """Send command to Node.js process and get response."""
         self._ensure_node_process()
-        
+
         if self._node_process is None:
             raise RuntimeError("Failed to start Node.js process")
-        
+        if self._node_process.stdin is None:
+            raise RuntimeError("Node process stdin not available")
+
         # Send command
         cmd_json = json.dumps(command) + "\n"
         self._node_process.stdin.write(cmd_json)
         self._node_process.stdin.flush()
-        
-        # Read response
-        response_line = self._node_process.stdout.readline()
-        return json.loads(response_line)
+
+        # Read response (skip non-JSON log lines)
+        return self._read_json_line()
 
     def take_screenshot(self, prefix: str = "qa") -> str:
         """Take screenshot of browser, return local path."""
         unique_id = uuid.uuid4().hex[:8]
         local_path = str(self._screenshot_dir / f"{prefix}_{unique_id}.png")
-        
-        response = self._send_command({
-            "action": "screenshot",
-            "path": local_path,
-        })
-        
+
+        response = self._send_command(
+            {
+                "action": "screenshot",
+                "path": local_path,
+            }
+        )
+
         if not response.get("success"):
             raise RuntimeError(f"Screenshot failed: {response.get('error')}")
-        
+
         return local_path
 
     def focus_window(self) -> None:
@@ -126,31 +156,37 @@ class WebExecutor:
 
     def execute_action(self, action: str) -> None:
         """Execute an action in the browser via Midscene.
-        
+
         Uses Midscene's aiAction for natural language commands.
         """
         # Parse action format
         if action.startswith("key:"):
             # Keyboard shortcut
             keys = action[4:]
-            response = self._send_command({
-                "action": "keyboard",
-                "keys": keys,
-            })
+            response = self._send_command(
+                {
+                    "action": "keyboard",
+                    "keys": keys,
+                }
+            )
         elif action.startswith("click:"):
             # Click element by text - use Midscene aiAction
             target = action[6:]
-            response = self._send_command({
-                "action": "aiAction",
-                "instruction": f"Click on '{target}'",
-            })
+            response = self._send_command(
+                {
+                    "action": "aiAction",
+                    "instruction": f"Click on '{target}'",
+                }
+            )
         elif action.startswith("type:"):
             # Type text
             text = action[5:]
-            response = self._send_command({
-                "action": "type",
-                "text": text,
-            })
+            response = self._send_command(
+                {
+                    "action": "type",
+                    "text": text,
+                }
+            )
         elif action.startswith("wait:"):
             # Wait milliseconds
             ms = int(action[5:])
@@ -159,17 +195,21 @@ class WebExecutor:
         elif action.startswith("goto:"):
             # Navigate to URL
             url = action[5:]
-            response = self._send_command({
-                "action": "goto",
-                "url": url,
-            })
+            response = self._send_command(
+                {
+                    "action": "goto",
+                    "url": url,
+                }
+            )
         else:
             # Natural language action via Midscene
-            response = self._send_command({
-                "action": "aiAction",
-                "instruction": action,
-            })
-        
+            response = self._send_command(
+                {
+                    "action": "aiAction",
+                    "instruction": action,
+                }
+            )
+
         if not response.get("success"):
             raise RuntimeError(f"Action failed: {response.get('error')}")
 
@@ -190,34 +230,35 @@ class WebExecutor:
         )
 
     def start_app(
-        self, 
-        target: str, 
-        name: str, 
-        env: dict[str, str] | None = None
+        self, target: str, name: str, env: dict[str, str] | None = None
     ) -> AppStartResult:
         """Open URL in browser.
-        
+
         For web executor, target should be a URL.
         """
         try:
             self._ensure_node_process()
-            
-            response = self._send_command({
-                "action": "launch",
-                "url": target,
-                "config": {
-                    "browser": self.config.browser,
-                    "headless": self.config.headless,
-                    "viewport": {
-                        "width": self.config.viewport_width,
-                        "height": self.config.viewport_height,
+
+            response = self._send_command(
+                {
+                    "action": "launch",
+                    "url": target,
+                    "config": {
+                        "browser": self.config.browser,
+                        "headless": self.config.headless,
+                        "viewport": {
+                            "width": self.config.viewport_width,
+                            "height": self.config.viewport_height,
+                        },
                     },
-                },
-            })
-            
+                }
+            )
+
             if not response.get("success"):
-                return AppStartResult(False, None, f"Failed to open: {response.get('error')}")
-            
+                return AppStartResult(
+                    False, None, f"Failed to open: {response.get('error')}"
+                )
+
             return AppStartResult(True, None, f"Opened {target}")
         except Exception as e:
             return AppStartResult(False, None, str(e))
@@ -231,11 +272,13 @@ class WebExecutor:
                 pass
             self._node_process.terminate()
             self._node_process = None
+            self._ready = False
 
     def __del__(self):
         """Cleanup Node.js process on destruction."""
         if self._node_process is not None:
             self._node_process.terminate()
+            self._ready = False
 
 
 # Factory function

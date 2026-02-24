@@ -40,3 +40,6 @@ packages = ["src/ui_verdict"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: integration tests requiring real browser/VM",
+]

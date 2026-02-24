@@ -5,11 +5,12 @@
   "type": "module",
   "main": "executor.js",
   "scripts": {
-    "start": "node executor.js"
+    "start": "node executor.js",
+    "test": "node test.js"
   },
   "dependencies": {
-    "@anthropic/midscene": "^1.0.0",
-    "@midscene/web": "^1.4.0",
+    "@midscene/web": "^1.4.6",
+    "@playwright/test": "^1.58.2",
     "playwright": "^1.50.0"
   }
 }
