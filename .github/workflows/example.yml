@@ -1,0 +1,31 @@
+# Example: Copy this to your project's .github/workflows/visual-test.yml
+name: Visual Regression Test (Example)
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+jobs:
+  visual-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Visual Regression Test
+        uses: ninosclaude/ui-verdict@main
+        with:
+          url: 'https://example.com'
+          baseline: 'homepage'
+          acceptance-criteria: 'Page loads,Content visible'
+      
+      - name: Upload Test Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: visual-test-results
+          path: |
+            /tmp/qa_web_screenshots/*.png
+          retention-days: 7

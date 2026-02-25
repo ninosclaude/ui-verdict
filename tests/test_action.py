@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.ui_verdict.action import (
+from ui_verdict.action import (
     parse_action,
     ActionType,
     ActionParseError,
