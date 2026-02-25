@@ -296,9 +296,9 @@ class TestBuildVerificationPrompt:
             ["Button is visible"], has_before_after=False
         )
 
-        assert "SPECIFIC location" in prompt
-        assert 'not "visible" or "on the page"' in prompt
-        assert "actionable suggestion" in prompt
+        assert "SPECIFIC like" in prompt
+        assert "NOT acceptable locations" in prompt
+        assert "SCAN THE ENTIRE PAGE" in prompt
 
     def test_json_format_example(self):
         """Test prompt includes JSON format examples."""
